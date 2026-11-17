@@ -1011,6 +1011,69 @@ class BleTransportTest {
         readerTransport.close()
     }
 
+    @Test
+    fun channelSoundingAvailablePropagatedThroughTransportsAndCoalescing() = runTest {
+        val mdocMethods = listOf(
+            MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                uuid = testUuid,
+                channelSoundingAvailable = true,
+            ),
+            MdocConnectionMethod.Ble.GattPeripheral(
+                uuid = testUuid,
+                channelSoundingAvailable = true,
+            ),
+        )
+        val mdocTransports = createMdocTransportsFromManagers(
+            connectionMethods = mdocMethods,
+            role = MdocRole.MDOC,
+            options = MdocTransportOptions(),
+            centralManagerFactory = { FakeBleCentralManager(expectedIdent = senderIdent) },
+            peripheralManagerFactory = {
+                FakeBlePeripheralManager(publishedL2capPsm = 130, peerAddress = "11:22:33:44:55:66")
+            },
+            nonBleTransportFactory = { error("Unexpected $it") },
+        )
+        assertEquals(1, mdocTransports.size)
+        val mdocPeripheral = mdocTransports.single()
+        mdocPeripheral.advertise()
+        assertEquals(
+            listOf(
+                MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                    uuid = testUuid,
+                    psm = 130,
+                    channelSoundingAvailable = true,
+                ),
+                MdocConnectionMethod.Ble.GattPeripheral(
+                    uuid = testUuid,
+                    channelSoundingAvailable = true,
+                ),
+            ),
+            mdocPeripheral.connectionMethods
+        )
+        mdocPeripheral.open(senderKey)
+        assertEquals(MdocTransport.State.CONNECTED, mdocPeripheral.state.value)
+        mdocPeripheral.close()
+
+        val readerTransports = createMdocTransportsFromManagers(
+            connectionMethods = mdocPeripheral.connectionMethods,
+            role = MdocRole.MDOC_READER,
+            options = MdocTransportOptions(),
+            centralManagerFactory = {
+                FakeBleCentralManager(expectedIdent = senderIdent, peerAddress = "11:22:33:44:55:66")
+            },
+            peripheralManagerFactory = { FakeBlePeripheralManager() },
+            nonBleTransportFactory = { error("Unexpected $it") },
+        )
+        assertEquals(2, readerTransports.size)
+        for (transport in readerTransports) {
+            val cm = assertIs<MdocConnectionMethod.Ble>(transport.connectionMethod)
+            assertTrue(cm.channelSoundingAvailable)
+            transport.open(senderKey)
+            assertEquals(MdocTransport.State.CONNECTED, transport.state.value)
+            transport.close()
+        }
+    }
+
     /**
      * Wraps a real [BlePeripheralManagerImpl] with a [FakeBlePeripheralHal] so tests can exercise the
      * full [BlePeripheralManagerImpl] state machine while inspecting recorded HAL calls and injecting
@@ -1036,6 +1099,7 @@ class BleTransportTest {
         autoConnectGattClient: Boolean = true,
         autoConnectL2capClient: Boolean = false,
         failSendMessage: Throwable? = null,
+        peerAddress: String? = null,
         private val hal: FakeBlePeripheralHal = FakeBlePeripheralHal(
             autoPowerOn = autoPowerOn,
             powerOnError = powerOnError,
@@ -1043,6 +1107,7 @@ class BleTransportTest {
             autoConnectGattClient = autoConnectGattClient,
             autoConnectL2capClient = autoConnectL2capClient,
             failSendMessage = failSendMessage,
+            peerBluetoothAddress = peerAddress,
         ),
         private val impl: BlePeripheralManagerImpl = BlePeripheralManagerImpl(hal)
     ) : BlePeripheralManager by impl {
@@ -1092,6 +1157,7 @@ class BleTransportTest {
         private val autoConnectGattClient: Boolean = true,
         private val autoConnectL2capClient: Boolean = false,
         private val failSendMessage: Throwable? = null,
+        override val peerBluetoothAddress: String? = null,
     ) : BlePeripheralHal {
         lateinit var halCallback: BlePeripheralHal.Callback
         var waitForPowerOnCalls = 0
@@ -1210,11 +1276,13 @@ class BleTransportTest {
         scanError: Throwable? = null,
         expectedIdent: ByteArray = ByteArray(16),
         remoteL2capPsm: Int? = null,
+        peerAddress: String? = null,
         private val hal: FakeBleCentralHal = FakeBleCentralHal(
             autoDiscoverPeripheral = autoDiscoverPeripheral,
             scanError = scanError,
             expectedIdent = expectedIdent,
             remoteL2capPsm = remoteL2capPsm,
+            peerBluetoothAddress = peerAddress,
         ),
         private val impl: BleCentralManagerImpl = BleCentralManagerImpl(
             hal = hal,
@@ -1258,6 +1326,7 @@ class BleTransportTest {
         private val scanError: Throwable? = null,
         private val expectedIdent: ByteArray = ByteArray(16),
         private val remoteL2capPsm: Int? = null,
+        override val peerBluetoothAddress: String? = null,
     ) : BleCentralHal {
         lateinit var halCallback: BleCentralHal.Callback
         override var isConnected: Boolean = false

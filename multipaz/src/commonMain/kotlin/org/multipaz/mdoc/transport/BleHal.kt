@@ -104,6 +104,12 @@ interface BleCentralHal {
      */
     val isConnected: Boolean
 
+    /**
+     * The Bluetooth MAC address of the connected peer peripheral if available (for example on Android), or `null`.
+     */
+    val peerBluetoothAddress: String?
+        get() = null
+
     /** Registers the [Callback] receiver for asynchronous BLE central events. */
     fun setCallback(callback: Callback)
 
@@ -214,6 +220,12 @@ interface BlePeripheralHal {
         /** Invoked when an unrecoverable asynchronous transport error occurs. */
         fun onError(error: Throwable)
     }
+
+    /**
+     * The Bluetooth MAC address of the connected peer central if available (for example on Android), or `null`.
+     */
+    val peerBluetoothAddress: String?
+        get() = null
 
     /** Registers the [Callback] receiver for asynchronous BLE peripheral events. */
     fun setCallback(callback: Callback)
@@ -385,7 +397,10 @@ fun createMdocTransports(
 
 private sealed interface CoalescedTransportSpec {
     data class SingleBle(val method: MdocConnectionMethod.Ble, val uuid: UUID) : CoalescedTransportSpec
-    data class DualBlePeripheral(val uuid: UUID) : CoalescedTransportSpec
+    data class DualBlePeripheral(
+        val uuid: UUID,
+        val channelSoundingAvailable: Boolean,
+    ) : CoalescedTransportSpec
     data class ReadyNonBle(val transport: MdocTransport) : CoalescedTransportSpec
 }
 
@@ -425,7 +440,12 @@ internal fun createMdocTransportsFromManagers(
         )
         if (partnerIndex != null) {
             consumedIndices.add(partnerIndex)
-            specs.add(CoalescedTransportSpec.DualBlePeripheral(uuid = uuid))
+            specs.add(
+                CoalescedTransportSpec.DualBlePeripheral(
+                    uuid = uuid,
+                    channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
+                )
+            )
         } else {
             if (connectionMethod is MdocConnectionMethod.Ble.DirectL2capCentral && role == MdocRole.MDOC) {
                 requireNotNull(connectionMethod.psm) {
@@ -454,6 +474,7 @@ internal fun createMdocTransportsFromManagers(
                     uuid = spec.uuid,
                     gattEnabled = true,
                     directL2capEnabled = true,
+                    channelSoundingAvailable = spec.channelSoundingAvailable,
                 )
                 MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
                     role = role,
@@ -462,6 +483,7 @@ internal fun createMdocTransportsFromManagers(
                     uuid = spec.uuid,
                     gattEnabled = true,
                     directL2capEnabled = true,
+                    channelSoundingAvailable = spec.channelSoundingAvailable,
                 )
             }
             is CoalescedTransportSpec.SingleBle -> createSingleBleTransportFromManagers(
@@ -498,7 +520,8 @@ private fun findCoHostedBlePeripheralPartnerIndex(
         }
         if (candidateIsSamePeripheralRole &&
             candidate.uuid == uuid &&
-            candidate.isDirectL2cap != ble.isDirectL2cap
+            candidate.isDirectL2cap != ble.isDirectL2cap &&
+            candidate.channelSoundingAvailable == ble.channelSoundingAvailable
         ) {
             return candidateIndex
         }
@@ -521,6 +544,7 @@ private fun createSingleBleTransportFromManagers(
             centralManager = centralManagerFactory(),
             uuid = uuid,
             psm = null,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
             role = role,
@@ -529,6 +553,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             gattEnabled = true,
             directL2capEnabled = false,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.DirectL2capCentral -> when (role) {
@@ -538,6 +563,7 @@ private fun createSingleBleTransportFromManagers(
             centralManager = centralManagerFactory(),
             uuid = uuid,
             psm = connectionMethod.psm!!,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
             role = role,
@@ -546,6 +572,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             gattEnabled = false,
             directL2capEnabled = true,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.GattPeripheral -> when (role) {
@@ -556,6 +583,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             gattEnabled = true,
             directL2capEnabled = false,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportPeripheralMdocReader(
             role = role,
@@ -563,6 +591,7 @@ private fun createSingleBleTransportFromManagers(
             centralManager = centralManagerFactory(),
             uuid = uuid,
             psm = null,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.DirectL2capPeripheral -> when (role) {
@@ -573,6 +602,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             gattEnabled = false,
             directL2capEnabled = true,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportPeripheralMdocReader(
             role = role,
@@ -580,6 +610,7 @@ private fun createSingleBleTransportFromManagers(
             centralManager = centralManagerFactory(),
             uuid = uuid,
             psm = connectionMethod.psm!!,
+            channelSoundingAvailable = connectionMethod.channelSoundingAvailable,
         )
     }
 }

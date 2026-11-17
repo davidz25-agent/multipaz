@@ -32,11 +32,13 @@ struct Iso18013ProximityPresentmentScreen: View {
                                         MdocConnectionMethod.BleDirectL2capPeripheral(
                                             uuid: bleUuid,
                                             psm: nil,
-                                            peripheralAddress: nil
+                                            peripheralAddress: nil,
+                                            channelSoundingAvailable: false
                                         ),
                                         MdocConnectionMethod.BleGattPeripheral(
                                             uuid: bleUuid,
-                                            peripheralAddress: nil
+                                            peripheralAddress: nil,
+                                            channelSoundingAvailable: false
                                         )
                                     ]
                                     let settings = MdocProximityQrSettings(

@@ -35,6 +35,7 @@ internal class BleTransportPeripheralMdoc(
     private val uuid: UUID,
     private val gattEnabled: Boolean = true,
     private val directL2capEnabled: Boolean = false,
+    private val channelSoundingAvailable: Boolean = false,
 ) : MdocTransport() {
     companion object {
         private const val TAG = "BleTransportPeripheralMdoc"
@@ -44,6 +45,8 @@ internal class BleTransportPeripheralMdoc(
     private val mutex = Mutex()
     @Volatile
     private var currentJob: Job? = null
+    @Volatile
+    private var channelSoundingJob: Job? = null
 
     private val _state = MutableStateFlow<State>(State.IDLE)
     override val state: StateFlow<State> = _state.asStateFlow()
@@ -52,13 +55,30 @@ internal class BleTransportPeripheralMdoc(
         get() = buildList {
             val psm = if (directL2capEnabled) peripheralManager.l2capPsm else null
             if (psm != null) {
-                add(MdocConnectionMethod.Ble.DirectL2capPeripheral(uuid = uuid, psm = psm))
+                add(
+                    MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                        uuid = uuid,
+                        psm = psm,
+                        channelSoundingAvailable = channelSoundingAvailable,
+                    )
+                )
             }
             if (gattEnabled) {
-                add(MdocConnectionMethod.Ble.GattPeripheral(uuid = uuid))
+                add(
+                    MdocConnectionMethod.Ble.GattPeripheral(
+                        uuid = uuid,
+                        channelSoundingAvailable = channelSoundingAvailable,
+                    )
+                )
             }
             if (isEmpty()) {
-                add(MdocConnectionMethod.Ble.DirectL2capPeripheral(uuid = uuid, psm = null))
+                add(
+                    MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                        uuid = uuid,
+                        psm = null,
+                        channelSoundingAvailable = channelSoundingAvailable,
+                    )
+                )
             }
         }
 
@@ -186,6 +206,14 @@ internal class BleTransportPeripheralMdoc(
                 peripheralManager.waitForStateCharacteristicWriteOrL2CAPClient()
                 _connectingTime = Clock.System.now() - timeConnectingStarted!!
                 mutex.withLock { _state.value = State.CONNECTED }
+                if (channelSoundingAvailable) {
+                    val peerAddress = peripheralManager.peerBluetoothAddress
+                    if (peerAddress != null) {
+                        channelSoundingJob = transportScope.launch {
+                            startBluetoothChannelSounding(peerAddress, asInitiator = false)
+                        }
+                    }
+                }
             }
         } catch (error: Exception) {
             timeConnectingStarted?.let { _connectingTime = Clock.System.now() - it }
@@ -286,12 +314,14 @@ internal class BleTransportPeripheralMdoc(
             return
         }
         Logger.w(TAG, "Failing transport with error", error)
+        channelSoundingJob?.cancel()
         peripheralManager.close()
         _state.value = State.FAILED
     }
 
     private fun closeWithoutDelay() {
         check(mutex.isLocked) { "closeWithoutDelay called without holding lock" }
+        channelSoundingJob?.cancel()
         peripheralManager.close()
         _state.value = State.CLOSED
     }
