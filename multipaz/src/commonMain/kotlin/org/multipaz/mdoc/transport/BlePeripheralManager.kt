@@ -2,6 +2,7 @@ package org.multipaz.mdoc.transport
 
 import kotlinx.coroutines.channels.Channel
 import kotlinx.io.bytestring.ByteString
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.util.UUID
 
@@ -60,6 +61,12 @@ internal interface BlePeripheralManager {
 
     // True if connected via L2CAP
     val usingL2cap: Boolean
+
+    suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit = {},
+    ) {}
 
     val negotiatedMtu: Int?
         get() = null

@@ -1181,6 +1181,14 @@ internal class BleCentralManagerImpl(
         }
     }
 
+    override suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        hal.startChannelSounding(asInitiator, ephemeralLtk, onResult)
+    }
+
     override suspend fun shutdown() {
         hal.shutdown()
     }

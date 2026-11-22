@@ -33,3 +33,5 @@ internal actual fun defaultMdocTransportFactoryCreateTransports(
         }
     },
 )
+
+internal actual suspend fun defaultMdocTransportFactoryIsBleChannelSoundingAvailable(): Boolean = false

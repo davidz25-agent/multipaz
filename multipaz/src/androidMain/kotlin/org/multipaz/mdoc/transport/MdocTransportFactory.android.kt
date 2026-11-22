@@ -40,6 +40,9 @@ class AndroidMdocTransportFactory(
             }
         },
     )
+
+    override suspend fun isBleChannelSoundingAvailable(): Boolean =
+        isAndroidBluetoothChannelSoundingAvailable()
 }
 
 internal actual fun defaultMdocTransportFactoryCreateTransport(
@@ -53,3 +56,6 @@ internal actual fun defaultMdocTransportFactoryCreateTransports(
     role: MdocRole,
     options: MdocTransportOptions,
 ): List<MdocTransport> = AndroidMdocTransportFactory().createTransports(connectionMethods, role, options)
+
+internal actual suspend fun defaultMdocTransportFactoryIsBleChannelSoundingAvailable(): Boolean =
+    AndroidMdocTransportFactory().isBleChannelSoundingAvailable()

@@ -1,0 +1,1099 @@
+diff --git a/android/app/jni/com_android_bluetooth_gatt.cpp b/android/app/jni/com_android_bluetooth_gatt.cpp
+index 2501905..91a2f52 100644
+--- a/android/app/jni/com_android_bluetooth_gatt.cpp
++++ b/android/app/jni/com_android_bluetooth_gatt.cpp
+@@ -1985,6 +1985,30 @@ static void stopDistanceMeasurementNative(JNIEnv* env, jobject /* object */, jst
+   sGattIf->distance_measurement_manager->StopDistanceMeasurement(str2addr(env, address), method);
+ }
+ 
++static void setChannelSoundingEphemeralLtkNative(JNIEnv* env, jobject /* object */, jstring address,
++                                                 jbyteArray ltk) {
++  if (!sGattIf || ltk == nullptr) {
++    return;
++  }
++  Octet16 octet_ltk{};
++  jsize len = env->GetArrayLength(ltk);
++  if (len != static_cast<jsize>(octet_ltk.size())) {
++    log::error("Invalid ephemeral LTK length: {}", len);
++    return;
++  }
++  env->GetByteArrayRegion(ltk, 0, static_cast<jsize>(octet_ltk.size()),
++                          reinterpret_cast<jbyte*>(octet_ltk.data()));
++  sGattIf->distance_measurement_manager->SetEphemeralOobLtk(str2addr(env, address), octet_ltk);
++}
++
++static void clearChannelSoundingEphemeralLtkNative(JNIEnv* env, jobject /* object */,
++                                                   jstring address) {
++  if (!sGattIf) {
++    return;
++  }
++  sGattIf->distance_measurement_manager->ClearEphemeralOobLtk(str2addr(env, address));
++}
++
+ // JNI functions defined in AdvertiseManagerNativeInterface
+ static int register_com_android_bluetooth_gatt_advertise_manager(JNIEnv* env) {
+   const JNINativeMethod methods[] = {
+@@ -2043,6 +2067,10 @@ static int register_com_android_bluetooth_gatt_distance_measurement(JNIEnv* env)
+            (void*)startDistanceMeasurementNative},
+           {"stopDistanceMeasurementNative", "(Ljava/lang/String;I)V",
+            (void*)stopDistanceMeasurementNative},
++          {"setChannelSoundingEphemeralLtkNative", "(Ljava/lang/String;[B)V",
++           (void*)setChannelSoundingEphemeralLtkNative},
++          {"clearChannelSoundingEphemeralLtkNative", "(Ljava/lang/String;)V",
++           (void*)clearChannelSoundingEphemeralLtkNative},
+   };
+   const int result = REGISTER_NATIVE_METHODS(
+           env, "com/android/bluetooth/gatt/DistanceMeasurementNativeInterface", methods);
+diff --git a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementManager.java b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementManager.java
+index 997db3a..b0d01cd 100644
+--- a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementManager.java
++++ b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementManager.java
+@@ -81,6 +81,8 @@ public class DistanceMeasurementManager {
+     private final DistanceMeasurementBinder mDistanceMeasurementBinder;
+     private final Map<String, Set<DistanceMeasurementTracker>> mRssiTrackers = new HashMap<>();
+     private final Map<String, Set<DistanceMeasurementTracker>> mCsTrackers = new HashMap<>();
++    private final Map<String, Set<DistanceMeasurementTracker>> mCsResponderTrackers =
++            new HashMap<>();
+     private final boolean mHasChannelSoundingFeature;
+ 
+     private volatile boolean mIsTurnedOff = false;
+@@ -128,13 +130,18 @@ public class DistanceMeasurementManager {
+             mHandler.removeCallbacksAndMessages(null);
+             mDistanceMeasurementBinder.cleanup();
+             mNativeInterface.cleanup();
+-            for (String addressForCs : mCsTrackers.keySet()) {
++            for (String addressForCs : new ArrayList<>(mCsTrackers.keySet())) {
+                 onDistanceMeasurementStopped(
+                         addressForCs,
+                         BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED,
+                         DISTANCE_MEASUREMENT_METHOD_CHANNEL_SOUNDING);
+             }
+-            for (String addressForRssi : mRssiTrackers.keySet()) {
++            for (String addressForCsResponder : new ArrayList<>(mCsResponderTrackers.keySet())) {
++                handleCsResponderStopped(
++                        addressForCsResponder,
++                        BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED);
++            }
++            for (String addressForRssi : new ArrayList<>(mRssiTrackers.keySet())) {
+                 onDistanceMeasurementStopped(
+                         addressForRssi,
+                         BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED,
+@@ -148,13 +155,19 @@ public class DistanceMeasurementManager {
+                         mDistanceMeasurementBinder.cleanup();
+                         mNativeInterface.cleanup();
+                         Log.d(TAG, "stop all sessions as BT is off");
+-                        for (String addressForCs : mCsTrackers.keySet()) {
++                        for (String addressForCs : new ArrayList<>(mCsTrackers.keySet())) {
+                             onDistanceMeasurementStopped(
+                                     addressForCs,
+                                     BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED,
+                                     DISTANCE_MEASUREMENT_METHOD_CHANNEL_SOUNDING);
+                         }
+-                        for (String addressForRssi : mRssiTrackers.keySet()) {
++                        for (String addressForCsResponder :
++                                new ArrayList<>(mCsResponderTrackers.keySet())) {
++                            handleCsResponderStopped(
++                                    addressForCsResponder,
++                                    BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED);
++                        }
++                        for (String addressForRssi : new ArrayList<>(mRssiTrackers.keySet())) {
+                             onDistanceMeasurementStopped(
+                                     addressForRssi,
+                                     BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED,
+@@ -199,7 +212,14 @@ public class DistanceMeasurementManager {
+                 ("startDistanceMeasurement(): device=" + device)
+                         + (", method=" + params.getMethodId()));
+ 
+-        int status = checkLinkRequirements(device);
++        final ChannelSoundingParams csParams = params.getChannelSoundingParams();
++        final boolean hasEphemeralLtk =
++                Flags.channelSoundingEphemeralLtk()
++                        && params.getMethodId() == DISTANCE_MEASUREMENT_METHOD_CHANNEL_SOUNDING
++                        && csParams != null
++                        && csParams.getEphemeralLtk() != null;
++
++        int status = checkLinkRequirements(device, hasEphemeralLtk);
+         if (status != BluetoothStatusCodes.SUCCESS) {
+             invokeStartFail(callback, device, status);
+             return;
+@@ -233,19 +253,33 @@ public class DistanceMeasurementManager {
+                     invokeStartFail(callback, device, BluetoothStatusCodes.FEATURE_NOT_SUPPORTED);
+                     return;
+                 }
+-                if (mAdapterService.getBondState(device) != BluetoothDevice.BOND_BONDED) {
++                if (!hasEphemeralLtk
++                        && mAdapterService.getBondState(device) != BluetoothDevice.BOND_BONDED) {
+                     Log.e(TAG, "startDistanceMeasurement(): Target device is not bonded");
+                     invokeStartFail(callback, device, BluetoothStatusCodes.ERROR_DEVICE_NOT_BONDED);
+                     return;
+                 }
+-                startCsTracker(tracker);
++                if (Flags.channelSoundingEphemeralLtk() && tracker.mResponderOnly) {
++                    if (tracker.mEphemeralLtk == null) {
++                        Log.e(
++                                TAG,
++                                "startDistanceMeasurement(): Responder-only CS requires ephemeral"
++                                        + " LTK");
++                        invokeStartFail(
++                                callback, device, BluetoothStatusCodes.ERROR_BAD_PARAMETERS);
++                        return;
++                    }
++                    startCsResponderTracker(tracker);
++                } else {
++                    startCsTracker(tracker);
++                }
+             }
+             default -> invokeStartFail(callback, device, BluetoothStatusCodes.ERROR_BAD_PARAMETERS);
+         }
+     }
+ 
+-    private int checkLinkRequirements(BluetoothDevice device) {
+-        if (!Flags.enforceSecurityForRanging()) {
++    private int checkLinkRequirements(BluetoothDevice device, boolean hasEphemeralLtk) {
++        if (!Flags.enforceSecurityForRanging() || hasEphemeralLtk) {
+             if (!mAdapterService.isConnected(device)) {
+                 Log.e(TAG, "checkLinkRequirements(): Device " + device + " is not connected");
+                 return BluetoothStatusCodes.ERROR_NO_LE_CONNECTION;
+@@ -310,6 +344,10 @@ public class DistanceMeasurementManager {
+             Log.w(TAG, "startCsTracker(): Already registered");
+             return;
+         }
++        if (Flags.channelSoundingEphemeralLtk() && tracker.mEphemeralLtk != null) {
++            mNativeInterface.setChannelSoundingEphemeralLtk(
++                    tracker.mIdentityAddress, tracker.mEphemeralLtk);
++        }
+         mNativeInterface.startDistanceMeasurement(
+                 tracker.mAppUid,
+                 tracker.mIdentityAddress,
+@@ -319,6 +357,44 @@ public class DistanceMeasurementManager {
+                 tracker.mLocationType);
+     }
+ 
++    private void startCsResponderTracker(DistanceMeasurementTracker tracker) {
++        mCsResponderTrackers.putIfAbsent(tracker.mIdentityAddress, new ArraySet<>());
++        Set<DistanceMeasurementTracker> set = mCsResponderTrackers.get(tracker.mIdentityAddress);
++        if (!set.add(tracker)) {
++            Log.w(TAG, "startCsResponderTracker(): Already registered");
++            return;
++        }
++        mNativeInterface.setChannelSoundingEphemeralLtk(
++                tracker.mIdentityAddress, tracker.mEphemeralLtk);
++        tracker.mStarted = true;
++        try {
++            tracker.mCallback.onStarted(tracker.mDevice);
++            tracker.startTimer(mHandler.getLooper());
++        } catch (RemoteException e) {
++            Log.e(TAG, "Exception: " + e);
++        }
++    }
++
++    private boolean hasActiveEphemeralLtkTracker(String identityAddress) {
++        Set<DistanceMeasurementTracker> initiators = mCsTrackers.get(identityAddress);
++        if (initiators != null) {
++            for (DistanceMeasurementTracker t : initiators) {
++                if (t.mEphemeralLtk != null) {
++                    return true;
++                }
++            }
++        }
++        Set<DistanceMeasurementTracker> responders = mCsResponderTrackers.get(identityAddress);
++        if (responders != null) {
++            for (DistanceMeasurementTracker t : responders) {
++                if (t.mEphemeralLtk != null) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
+     int stopDistanceMeasurement(UUID uuid, BluetoothDevice device, int method, boolean timeout) {
+         enforceThread();
+ 
+@@ -404,12 +480,36 @@ public class DistanceMeasurementManager {
+     }
+ 
+     private int stopCsTracker(UUID uuid, String identityAddress, boolean timeout) {
++        Set<DistanceMeasurementTracker> responderSet = mCsResponderTrackers.get(identityAddress);
++        if (responderSet != null) {
++            for (DistanceMeasurementTracker tracker : responderSet) {
++                if (tracker.equals(uuid, identityAddress)) {
++                    int reason =
++                            timeout
++                                    ? BluetoothStatusCodes.ERROR_TIMEOUT
++                                    : BluetoothStatusCodes.REASON_LOCAL_APP_REQUEST;
++                    invokeOnStopped(tracker.mCallback, tracker.mDevice, reason);
++                    tracker.cancelTimer();
++                    responderSet.remove(tracker);
++                    if (responderSet.isEmpty()) {
++                        mCsResponderTrackers.remove(identityAddress);
++                    }
++                    if (tracker.mEphemeralLtk != null
++                            && !hasActiveEphemeralLtkTracker(identityAddress)) {
++                        mNativeInterface.clearChannelSoundingEphemeralLtk(identityAddress);
++                    }
++                    return BluetoothStatusCodes.SUCCESS;
++                }
++            }
++        }
++
+         Set<DistanceMeasurementTracker> set = mCsTrackers.get(identityAddress);
+         if (set == null) {
+             Log.w(TAG, "stopCsTracker(): Can't find CS tracker");
+             return BluetoothStatusCodes.ERROR_DISTANCE_MEASUREMENT_INTERNAL;
+         }
+ 
++        boolean removedEphemeralLtk = false;
+         for (DistanceMeasurementTracker tracker : set) {
+             if (tracker.equals(uuid, identityAddress)) {
+                 int reason =
+@@ -418,6 +518,7 @@ public class DistanceMeasurementManager {
+                                 : BluetoothStatusCodes.REASON_LOCAL_APP_REQUEST;
+                 invokeOnStopped(tracker.mCallback, tracker.mDevice, reason);
+                 tracker.cancelTimer();
++                removedEphemeralLtk = tracker.mEphemeralLtk != null;
+                 set.remove(tracker);
+                 break;
+             }
+@@ -429,6 +530,9 @@ public class DistanceMeasurementManager {
+             mNativeInterface.stopDistanceMeasurement(
+                     identityAddress, DISTANCE_MEASUREMENT_METHOD_CHANNEL_SOUNDING);
+         }
++        if (removedEphemeralLtk && !hasActiveEphemeralLtkTracker(identityAddress)) {
++            mNativeInterface.clearChannelSoundingEphemeralLtk(identityAddress);
++        }
+         return BluetoothStatusCodes.SUCCESS;
+     }
+ 
+@@ -570,7 +674,11 @@ public class DistanceMeasurementManager {
+             Log.w(TAG, "handleCsStopped(): Can't find CS tracker");
+             return;
+         }
++        boolean hadEphemeralLtk = false;
+         for (DistanceMeasurementTracker tracker : set) {
++            if (tracker.mEphemeralLtk != null) {
++                hadEphemeralLtk = true;
++            }
+             if (tracker.mStarted) {
+                 tracker.cancelTimer();
+                 invokeOnStopped(tracker.mCallback, tracker.mDevice, reason);
+@@ -579,6 +687,32 @@ public class DistanceMeasurementManager {
+             }
+         }
+         mCsTrackers.remove(address);
++        if (hadEphemeralLtk && !hasActiveEphemeralLtkTracker(address)) {
++            mNativeInterface.clearChannelSoundingEphemeralLtk(address);
++        }
++    }
++
++    private void handleCsResponderStopped(String address, int reason) {
++        Set<DistanceMeasurementTracker> set = mCsResponderTrackers.get(address);
++        if (set == null) {
++            return;
++        }
++        boolean hadEphemeralLtk = false;
++        for (DistanceMeasurementTracker tracker : set) {
++            if (tracker.mEphemeralLtk != null) {
++                hadEphemeralLtk = true;
++            }
++            if (tracker.mStarted) {
++                tracker.cancelTimer();
++                invokeOnStopped(tracker.mCallback, tracker.mDevice, reason);
++            } else {
++                invokeStartFail(tracker.mCallback, tracker.mDevice, reason);
++            }
++        }
++        mCsResponderTrackers.remove(address);
++        if (hadEphemeralLtk && !hasActiveEphemeralLtkTracker(address)) {
++            mNativeInterface.clearChannelSoundingEphemeralLtk(address);
++        }
+     }
+ 
+     void onDistanceMeasurementResult(
+diff --git a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementNativeInterface.kt b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementNativeInterface.kt
+index b160785..5ebc487 100644
+--- a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementNativeInterface.kt
++++ b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementNativeInterface.kt
+@@ -44,6 +44,14 @@ class DistanceMeasurementNativeInterface(nativeCallback: DistanceMeasurementNati
+         stopDistanceMeasurementNative(address, method)
+     }
+ 
++    fun setChannelSoundingEphemeralLtk(address: String, ltk: ByteArray) {
++        setChannelSoundingEphemeralLtkNative(address, ltk)
++    }
++
++    fun clearChannelSoundingEphemeralLtk(address: String) {
++        clearChannelSoundingEphemeralLtkNative(address)
++    }
++
+     private external fun initializeNative()
+ 
+     private external fun cleanupNative()
+@@ -58,4 +66,8 @@ class DistanceMeasurementNativeInterface(nativeCallback: DistanceMeasurementNati
+     )
+ 
+     private external fun stopDistanceMeasurementNative(address: String, method: Int)
++
++    private external fun setChannelSoundingEphemeralLtkNative(address: String, ltk: ByteArray)
++
++    private external fun clearChannelSoundingEphemeralLtkNative(address: String)
+ }
+diff --git a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementTracker.java b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementTracker.java
+index 9018d75..cbdf505 100644
+--- a/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementTracker.java
++++ b/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementTracker.java
+@@ -37,6 +37,8 @@ class DistanceMeasurementTracker {
+     final int mInterval; // Report interval in ms
+     final int mSightType;
+     final int mLocationType;
++    final byte[] mEphemeralLtk;
++    final boolean mResponderOnly;
+     final IDistanceMeasurementCallback mCallback;
+     private final DistanceMeasurementManager mManager;
+     private final UUID mUuid;
+@@ -65,9 +67,13 @@ class DistanceMeasurementTracker {
+         if (params.getChannelSoundingParams() != null) {
+             mSightType = params.getChannelSoundingParams().getSightType();
+             mLocationType = params.getChannelSoundingParams().getLocationType();
++            mEphemeralLtk = params.getChannelSoundingParams().getEphemeralLtk();
++            mResponderOnly = params.getChannelSoundingParams().isResponderOnly();
+         } else {
+             mSightType = ChannelSoundingParams.SIGHT_TYPE_UNKNOWN;
+             mLocationType = ChannelSoundingParams.LOCATION_TYPE_UNKNOWN;
++            mEphemeralLtk = null;
++            mResponderOnly = false;
+         }
+         mCallback = callback;
+     }
+diff --git a/flags/ranging.aconfig b/flags/ranging.aconfig
+index e53d04f..81d8ab1 100644
+--- a/flags/ranging.aconfig
++++ b/flags/ranging.aconfig
+@@ -28,3 +28,11 @@ flag {
+         purpose: PURPOSE_BUGFIX
+     }
+ }
++
++flag {
++    name: "channel_sounding_ephemeral_ltk"
++    namespace: "bluetooth"
++    is_exported: true
++    description: "Support out-of-band ephemeral LTK and responder-only sessions for unbonded BLE Channel Sounding"
++    bug: "487455955"
++}
+diff --git a/framework/api/system-current.txt b/framework/api/system-current.txt
+index 8bd1691..c3351a4 100644
+--- a/framework/api/system-current.txt
++++ b/framework/api/system-current.txt
+@@ -1500,8 +1500,10 @@ package android.bluetooth.le {
+   public final class ChannelSoundingParams implements android.os.Parcelable {
+     method public int describeContents();
+     method public int getCsSecurityLevel();
++    method @FlaggedApi("com.android.bluetooth.flags.channel_sounding_ephemeral_ltk") @Nullable public byte[] getEphemeralLtk();
+     method public int getLocationType();
+     method public int getSightType();
++    method @FlaggedApi("com.android.bluetooth.flags.channel_sounding_ephemeral_ltk") public boolean isResponderOnly();
+     method public void writeToParcel(@NonNull android.os.Parcel, int);
+     field @NonNull public static final android.os.Parcelable.Creator<android.bluetooth.le.ChannelSoundingParams> CREATOR;
+     field public static final int CS_SECURITY_LEVEL_FOUR = 4; // 0x4
+@@ -1521,7 +1523,9 @@ package android.bluetooth.le {
+     ctor public ChannelSoundingParams.Builder();
+     method @NonNull public android.bluetooth.le.ChannelSoundingParams build();
+     method @NonNull public android.bluetooth.le.ChannelSoundingParams.Builder setCsSecurityLevel(int);
++    method @FlaggedApi("com.android.bluetooth.flags.channel_sounding_ephemeral_ltk") @NonNull public android.bluetooth.le.ChannelSoundingParams.Builder setEphemeralLtk(@Nullable byte[]);
+     method @NonNull public android.bluetooth.le.ChannelSoundingParams.Builder setLocationType(int);
++    method @FlaggedApi("com.android.bluetooth.flags.channel_sounding_ephemeral_ltk") @NonNull public android.bluetooth.le.ChannelSoundingParams.Builder setResponderOnly(boolean);
+     method @NonNull public android.bluetooth.le.ChannelSoundingParams.Builder setSightType(int);
+   }
+ 
+diff --git a/framework/java/android/bluetooth/le/ChannelSoundingParams.java b/framework/java/android/bluetooth/le/ChannelSoundingParams.java
+index ca76515..2d7a0ef 100644
+--- a/framework/java/android/bluetooth/le/ChannelSoundingParams.java
++++ b/framework/java/android/bluetooth/le/ChannelSoundingParams.java
+@@ -16,14 +16,18 @@
+ 
+ package android.bluetooth.le;
+ 
++import android.annotation.FlaggedApi;
+ import android.annotation.Hide;
+ import android.annotation.IntDef;
+ import android.annotation.NonNull;
++import android.annotation.Nullable;
+ import android.annotation.RequiresNoPermission;
+ import android.annotation.SystemApi;
+ import android.os.Parcel;
+ import android.os.Parcelable;
+ 
++import com.android.bluetooth.flags.Flags;
++
+ import java.lang.annotation.ElementType;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+@@ -111,12 +115,26 @@ public final class ChannelSoundingParams implements Parcelable {
+     private final int mSightType;
+     private final int mLocationType;
+     private final int mCsSecurityLevel;
++    private final @Nullable byte[] mEphemeralLtk;
++    private final boolean mResponderOnly;
+ 
+     @Hide
+     public ChannelSoundingParams(int sightType, int locationType, int csSecurityLevel) {
++        this(sightType, locationType, csSecurityLevel, null, false);
++    }
++
++    @Hide
++    public ChannelSoundingParams(
++            int sightType,
++            int locationType,
++            int csSecurityLevel,
++            @Nullable byte[] ephemeralLtk,
++            boolean responderOnly) {
+         mSightType = sightType;
+         mLocationType = locationType;
+         mCsSecurityLevel = csSecurityLevel;
++        mEphemeralLtk = ephemeralLtk == null ? null : ephemeralLtk.clone();
++        mResponderOnly = responderOnly;
+     }
+ 
+     /** Returns sight type of this ChannelSoundingParams. */
+@@ -143,6 +161,31 @@ public final class ChannelSoundingParams implements Parcelable {
+         return mCsSecurityLevel;
+     }
+ 
++    /**
++     * Returns the 16-byte out-of-band ephemeral Long Term Key (LTK) used to encrypt an unbonded BLE
++     * connection for Channel Sounding, or {@code null} when relying on an existing BLE bond.
++     */
++    @FlaggedApi(Flags.FLAG_CHANNEL_SOUNDING_EPHEMERAL_LTK)
++    @Hide
++    @SystemApi
++    @RequiresNoPermission
++    public @Nullable byte[] getEphemeralLtk() {
++        return mEphemeralLtk == null ? null : mEphemeralLtk.clone();
++    }
++
++    /**
++     * Returns {@code true} if this session configures the local device strictly as a Channel
++     * Sounding responder (encrypting or accepting encryption with an ephemeral LTK without
++     * initiating CS procedures locally).
++     */
++    @FlaggedApi(Flags.FLAG_CHANNEL_SOUNDING_EPHEMERAL_LTK)
++    @Hide
++    @SystemApi
++    @RequiresNoPermission
++    public boolean isResponderOnly() {
++        return mResponderOnly;
++    }
++
+     @Override
+     public int describeContents() {
+         return 0;
+@@ -153,6 +196,8 @@ public final class ChannelSoundingParams implements Parcelable {
+         out.writeInt(mSightType);
+         out.writeInt(mLocationType);
+         out.writeInt(mCsSecurityLevel);
++        out.writeByteArray(mEphemeralLtk);
++        out.writeBoolean(mResponderOnly);
+     }
+ 
+     /** A {@link Parcelable.Creator} to create {@link ChannelSoundingParams} from parcel. */
+@@ -164,6 +209,12 @@ public final class ChannelSoundingParams implements Parcelable {
+                     builder.setSightType(in.readInt());
+                     builder.setLocationType(in.readInt());
+                     builder.setCsSecurityLevel(in.readInt());
++                    byte[] ephemeralLtk = in.createByteArray();
++                    boolean responderOnly = in.readBoolean();
++                    if (Flags.channelSoundingEphemeralLtk()) {
++                        builder.setEphemeralLtk(ephemeralLtk);
++                        builder.setResponderOnly(responderOnly);
++                    }
+                     return builder.build();
+                 }
+ 
+@@ -180,6 +231,8 @@ public final class ChannelSoundingParams implements Parcelable {
+         private int mSightType = SIGHT_TYPE_UNKNOWN;
+         private int mLocationType = LOCATION_TYPE_UNKNOWN;
+         private int mCsSecurityLevel = CS_SECURITY_LEVEL_ONE;
++        private @Nullable byte[] mEphemeralLtk = null;
++        private boolean mResponderOnly = false;
+ 
+         /**
+          * Set sight type for the ChannelSoundingParams.
+@@ -241,12 +294,50 @@ public final class ChannelSoundingParams implements Parcelable {
+             return this;
+         }
+ 
++        /**
++         * Set a 16-byte out-of-band ephemeral Long Term Key (LTK) used to encrypt an unbonded BLE
++         * connection for Channel Sounding (with {@code EDIV = 0} and {@code Rand = 0}).
++         *
++         * @param ephemeralLtk 16-byte ephemeral LTK, or {@code null} to require a BLE bond
++         * @return the same Builder instance
++         * @throws IllegalArgumentException if {@code ephemeralLtk} is non-null and not 16 bytes
++         */
++        @FlaggedApi(Flags.FLAG_CHANNEL_SOUNDING_EPHEMERAL_LTK)
++        @Hide
++        @SystemApi
++        @RequiresNoPermission
++        public @NonNull Builder setEphemeralLtk(@Nullable byte[] ephemeralLtk) {
++            if (ephemeralLtk != null && ephemeralLtk.length != 16) {
++                throw new IllegalArgumentException(
++                        "ephemeral LTK must be 16 bytes, got " + ephemeralLtk.length);
++            }
++            mEphemeralLtk = ephemeralLtk == null ? null : ephemeralLtk.clone();
++            return this;
++        }
++
++        /**
++         * Set whether this session configures the local device strictly as a Channel Sounding
++         * responder without initiating local CS procedures.
++         *
++         * @param responderOnly {@code true} for responder-only mode
++         * @return the same Builder instance
++         */
++        @FlaggedApi(Flags.FLAG_CHANNEL_SOUNDING_EPHEMERAL_LTK)
++        @Hide
++        @SystemApi
++        @RequiresNoPermission
++        public @NonNull Builder setResponderOnly(boolean responderOnly) {
++            mResponderOnly = responderOnly;
++            return this;
++        }
++
+         /** Build the {@link ChannelSoundingParams} object. */
+         @Hide
+         @SystemApi
+         @RequiresNoPermission
+         public @NonNull ChannelSoundingParams build() {
+-            return new ChannelSoundingParams(mSightType, mLocationType, mCsSecurityLevel);
++            return new ChannelSoundingParams(
++                    mSightType, mLocationType, mCsSecurityLevel, mEphemeralLtk, mResponderOnly);
+         }
+     }
+ }
+diff --git a/framework/java/android/bluetooth/le/DistanceMeasurementManager.java b/framework/java/android/bluetooth/le/DistanceMeasurementManager.java
+index 70f41b2..3b50126 100644
+--- a/framework/java/android/bluetooth/le/DistanceMeasurementManager.java
++++ b/framework/java/android/bluetooth/le/DistanceMeasurementManager.java
+@@ -62,18 +62,18 @@ import java.util.stream.Collectors;
+ public final class DistanceMeasurementManager {
+     private static final String TAG = DistanceMeasurementManager.class.getSimpleName();
+ 
+-    private final ConcurrentHashMap<BluetoothDevice, DistanceMeasurementSession> mSessionMap =
++    private record SessionKey(BluetoothDevice device, boolean responderOnly) {}
++
++    private final ConcurrentHashMap<SessionKey, DistanceMeasurementSession> mSessionMap =
+             new ConcurrentHashMap<>();
+     private final BluetoothAdapter mAdapter;
+     private final AttributionSource mAttributionSource;
+-    private final ParcelUuid mUuid;
+ 
+     /** Use {@link BluetoothAdapter#getDistanceMeasurementManager()} instead. */
+     @Hide
+     public DistanceMeasurementManager(BluetoothAdapter bluetoothAdapter) {
+         mAdapter = requireNonNull(bluetoothAdapter);
+         mAttributionSource = mAdapter.getAttributionSource();
+-        mUuid = new ParcelUuid(UUID.randomUUID());
+     }
+ 
+     /**
+@@ -138,10 +138,16 @@ public final class DistanceMeasurementManager {
+                 Log.e(TAG, "Distance Measurement is null");
+                 return null;
+             }
++            ParcelUuid sessionUuid = new ParcelUuid(UUID.randomUUID());
++            boolean responderOnly =
++                    com.android.bluetooth.flags.Flags.channelSoundingEphemeralLtk()
++                            && params.getChannelSoundingParams() != null
++                            && params.getChannelSoundingParams().isResponderOnly();
++            SessionKey sessionKey = new SessionKey(params.getDevice(), responderOnly);
+             DistanceMeasurementSession session =
+                     new DistanceMeasurementSession(
+                             distanceMeasurement,
+-                            mUuid,
++                            sessionUuid,
+                             params,
+                             executor,
+                             mAttributionSource,
+@@ -149,14 +155,14 @@ public final class DistanceMeasurementManager {
+             CancellationSignal cancellationSignal = new CancellationSignal();
+             cancellationSignal.setOnCancelListener(() -> session.stopSession());
+ 
+-            if (mSessionMap.containsKey(params.getDevice())) {
++            if (mSessionMap.putIfAbsent(sessionKey, session) != null) {
+                 throw new IllegalStateException(
+                         params.getDevice().getAnonymizedAddress() + " already registered");
+             }
+ 
+-            mSessionMap.put(params.getDevice(), session);
++            IDistanceMeasurementCallback callbackWrapper = createCallbackWrapper(sessionKey);
+             distanceMeasurement.startDistanceMeasurement(
+-                    mUuid, params, mCallbackWrapper, mAttributionSource);
++                    sessionUuid, params, callbackWrapper, mAttributionSource);
+             return cancellationSignal;
+         } catch (RemoteException e) {
+             Log.e(TAG, e.toString() + "\n" + Log.getStackTraceString(new Throwable()));
+@@ -271,32 +277,39 @@ public final class DistanceMeasurementManager {
+     }
+ 
+     @SuppressLint("AndroidFrameworkBluetoothPermission")
+-    private final IDistanceMeasurementCallback mCallbackWrapper =
+-            new IDistanceMeasurementCallback.Stub() {
+-                @Override
+-                public void onStarted(BluetoothDevice device) {
+-                    DistanceMeasurementSession session = mSessionMap.get(device);
++    private IDistanceMeasurementCallback createCallbackWrapper(SessionKey sessionKey) {
++        return new IDistanceMeasurementCallback.Stub() {
++            @Override
++            public void onStarted(BluetoothDevice device) {
++                DistanceMeasurementSession session = mSessionMap.get(sessionKey);
++                if (session != null) {
+                     session.onStarted();
+                 }
++            }
+ 
+-                @Override
+-                public void onStartFail(BluetoothDevice device, int reason) {
+-                    DistanceMeasurementSession session = mSessionMap.get(device);
++            @Override
++            public void onStartFail(BluetoothDevice device, int reason) {
++                DistanceMeasurementSession session = mSessionMap.remove(sessionKey);
++                if (session != null) {
+                     session.onStartFail(reason);
+-                    mSessionMap.remove(device);
+                 }
++            }
+ 
+-                @Override
+-                public void onStopped(BluetoothDevice device, int reason) {
+-                    DistanceMeasurementSession session = mSessionMap.get(device);
++            @Override
++            public void onStopped(BluetoothDevice device, int reason) {
++                DistanceMeasurementSession session = mSessionMap.remove(sessionKey);
++                if (session != null) {
+                     session.onStopped(reason);
+-                    mSessionMap.remove(device);
+                 }
++            }
+ 
+-                @Override
+-                public void onResult(BluetoothDevice device, DistanceMeasurementResult result) {
+-                    DistanceMeasurementSession session = mSessionMap.get(device);
++            @Override
++            public void onResult(BluetoothDevice device, DistanceMeasurementResult result) {
++                DistanceMeasurementSession session = mSessionMap.get(sessionKey);
++                if (session != null) {
+                     session.onResult(device, result);
+                 }
+-            };
++            }
++        };
++    }
+ }
+diff --git a/system/gd/hci/distance_measurement_manager_impl.cc b/system/gd/hci/distance_measurement_manager_impl.cc
+index de77408..9fec330 100644
+--- a/system/gd/hci/distance_measurement_manager_impl.cc
++++ b/system/gd/hci/distance_measurement_manager_impl.cc
+@@ -243,7 +243,8 @@ struct DistanceMeasurementManagerImpl::impl : bluetooth::hal::RangingHalCallback
+     std::unique_ptr<cs::RequesterSessionMetrics> requester_metrics_ = nullptr;
+   };
+ 
+-  bool get_free_config_id(uint16_t connection_handle, uint8_t& config_id) {
++  bool get_free_config_id(uint16_t connection_handle, uint8_t& config_id,
++                          hci::Role local_hci_role = hci::Role::CENTRAL) {
+     uint8_t requester_used_config_id = kInvalidConfigId;
+     if (cs_requester_trackers_.find(connection_handle) != cs_requester_trackers_.end()) {
+       requester_used_config_id = cs_requester_trackers_[connection_handle].used_config_id;
+@@ -253,6 +254,19 @@ struct DistanceMeasurementManagerImpl::impl : bluetooth::hal::RangingHalCallback
+       responder_used_config_id = cs_responder_trackers_[connection_handle].used_config_id;
+     }
+ 
++    // Partition preferred Config_ID ranges by LE ACL role (Central: 0..1, Peripheral: 2..3) to
++    // avoid simultaneous Create_Config collisions during bidirectional Channel Sounding.
++    const uint8_t preferred_start =
++            (local_hci_role == hci::Role::PERIPHERAL) ? static_cast<uint8_t>(2) : kMinConfigId;
++    const uint8_t preferred_end =
++            (local_hci_role == hci::Role::PERIPHERAL) ? kMaxConfigId : static_cast<uint8_t>(1);
++    for (uint8_t i = preferred_start; i <= preferred_end && i <= kMaxConfigId; i++) {
++      if (i != requester_used_config_id && i != responder_used_config_id) {
++        config_id = i;
++        return true;
++      }
++    }
++
+     for (auto i = kMinConfigId; i <= kMaxConfigId; i++) {
+       if (i != requester_used_config_id && i != responder_used_config_id) {
+         config_id = i;
+@@ -492,7 +506,7 @@ struct DistanceMeasurementManagerImpl::impl : bluetooth::hal::RangingHalCallback
+     it->second.address = cs_remote_address;
+     if (it->second.used_config_id == kInvalidConfigId) {
+       uint8_t config_id;
+-      if (get_free_config_id(connection_handle, config_id)) {
++      if (get_free_config_id(connection_handle, config_id, local_hci_role)) {
+         it->second.requesting_config_id = config_id;
+       } else {
+         log::error("No config id available, stop");
+diff --git a/system/include/hardware/distance_measurement_interface.h b/system/include/hardware/distance_measurement_interface.h
+index 82c4472..8ba1857 100644
+--- a/system/include/hardware/distance_measurement_interface.h
++++ b/system/include/hardware/distance_measurement_interface.h
+@@ -18,6 +18,7 @@
+ #define ANDROID_INCLUDE_DISTANCE_MEASUREMENT_INTERFACE_H
+ 
+ #include <bluetooth/types/address.h>
++#include <bluetooth/types/bt_octets.h>
+ #include <stdint.h>
+ 
+ /**
+@@ -47,6 +48,8 @@ public:
+                                         uint8_t method, uint8_t sight_type,
+                                         uint8_t locationType) = 0;
+   virtual void StopDistanceMeasurement(RawAddress raw_address, uint8_t method) = 0;
++  virtual void SetEphemeralOobLtk(RawAddress /*raw_address*/, const Octet16& /*ltk*/) {}
++  virtual void ClearEphemeralOobLtk(RawAddress /*raw_address*/) {}
+ };
+ 
+ #endif /* ANDROID_INCLUDE_DISTANCE_MEASUREMENT_INTERFACE_H */
+diff --git a/system/main/shim/distance_measurement_manager.cc b/system/main/shim/distance_measurement_manager.cc
+index cb548a8..0d9bca4 100644
+--- a/system/main/shim/distance_measurement_manager.cc
++++ b/system/main/shim/distance_measurement_manager.cc
+@@ -35,6 +35,8 @@ using namespace bluetooth;
+ 
+ extern BtmDevice* btm_find_dev(const RawAddress& bd_addr);
+ extern bool BTM_IsEncrypted(const RawAddress& bd_addr, tBT_TRANSPORT transport);
++extern void btm_ble_set_ephemeral_oob_ltk(const RawAddress& bd_addr, const Octet16& ltk);
++extern void btm_ble_clear_ephemeral_oob_ltk(const RawAddress& bd_addr);
+ 
+ class DistanceMeasurementInterfaceImpl : public DistanceMeasurementInterface,
+                                          public bluetooth::hci::DistanceMeasurementCallbacks,
+@@ -120,6 +122,14 @@ public:
+                                      base::Unretained(this), identity_addr, method));
+   }
+ 
++  void SetEphemeralOobLtk(RawAddress identity_addr, const Octet16& ltk) override {
++    do_in_main_thread(base::BindOnce(&btm_ble_set_ephemeral_oob_ltk, identity_addr, ltk));
++  }
++
++  void ClearEphemeralOobLtk(RawAddress identity_addr) override {
++    do_in_main_thread(base::BindOnce(&btm_ble_clear_ephemeral_oob_ltk, identity_addr));
++  }
++
+   void DoStopDistanceMeasurement(RawAddress identity_addr, uint8_t method) {
+     bluetooth::shim::GetDistanceMeasurementManager()->StopDistanceMeasurement(
+             identity_addr, GetConnectionHandleAndRole(identity_addr),
+diff --git a/system/stack/btm/btm_ble_sec.cc b/system/stack/btm/btm_ble_sec.cc
+index 9ee6a07..b95449c 100644
+--- a/system/stack/btm/btm_ble_sec.cc
++++ b/system/stack/btm/btm_ble_sec.cc
+@@ -35,6 +35,7 @@
+ #include "device/include/interop.h"
+ #include "hci/controller.h"
+ #include "main/shim/entry.h"
++#include "osi/include/alarm.h"
+ #include "osi/include/allocator.h"
+ #include "osi/include/properties.h"
+ #include "platform_ssl_mem.h"
+@@ -68,6 +69,77 @@ using namespace bluetooth;
+ 
+ namespace {
+ constexpr char kBtmLogTag[] = "SEC";
++constexpr uint64_t kEphemeralLtkReqHoldTimeoutMs = 1500;
++
++void btm_ble_ephemeral_ltk_req_timeout(void* data) {
++  uint16_t handle = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(data));
++  BtmDevice* p_device = btm_get_dev_by_handle(handle);
++  if (p_device != nullptr && p_device->sec_rec.pending_zero_ediv_ltk_req) {
++    p_device->sec_rec.pending_zero_ediv_ltk_req = false;
++    log::warn("Timed out waiting for ephemeral OOB LTK on handle 0x{:04x}, sending neg reply",
++              handle);
++    btsnd_hcic_ble_ltk_req_neg_reply(handle);
++  }
++}
++}  // namespace
++
++bool btm_ble_has_ephemeral_oob_ltk(const RawAddress& bd_addr) {
++  const BtmDevice* p_device = btm_find_dev(bd_addr);
++  return p_device != nullptr && p_device->sec_rec.has_ephemeral_oob_ltk;
++}
++
++void btm_ble_set_ephemeral_oob_ltk(const RawAddress& bd_addr, const Octet16& ltk) {
++  BtmDevice* p_device = btm_get_dev(bd_addr);
++  if (p_device == nullptr) {
++    log::warn("Cannot set ephemeral OOB LTK: unknown device {}", bd_addr);
++    return;
++  }
++
++  p_device->sec_rec.ephemeral_oob_ltk = ltk;
++  p_device->sec_rec.has_ephemeral_oob_ltk = true;
++  p_device->sec_rec.le_enc_key_size = MAX_KEY_SIZE;
++
++  if (p_device->sec_rec.pending_zero_ediv_ltk_req) {
++    p_device->sec_rec.pending_zero_ediv_ltk_req = false;
++    if (p_device->sec_rec.ephemeral_ltk_req_timer != nullptr) {
++      alarm_cancel(p_device->sec_rec.ephemeral_ltk_req_timer);
++    }
++    if (p_device->ble_hci_handle != HCI_INVALID_HANDLE) {
++      log::info("Answering held zero-EDIV LTK request with ephemeral OOB LTK for {}", bd_addr);
++      BtmSecurity::Get().enc_handle_ = p_device->ble_hci_handle;
++      BtmSecurity::Get().key_size_ = MAX_KEY_SIZE;
++      btsnd_hcic_ble_ltk_req_reply(p_device->ble_hci_handle, p_device->sec_rec.ephemeral_oob_ltk);
++    }
++    return;
++  }
++
++  if (p_device->ble_hci_handle != HCI_INVALID_HANDLE && p_device->role_central &&
++      !p_device->sec_rec.is_le_device_encrypted() &&
++      !p_device->sec_rec.is_security_state_le_encrypting()) {
++    log::info("Starting LE encryption on central using ephemeral OOB LTK for {}", bd_addr);
++    btm_ble_start_encrypt(bd_addr, /*use_stk=*/true, &p_device->sec_rec.ephemeral_oob_ltk);
++  }
++}
++
++void btm_ble_clear_ephemeral_oob_ltk(const RawAddress& bd_addr) {
++  BtmDevice* p_device = btm_get_dev(bd_addr);
++  if (p_device == nullptr) {
++    return;
++  }
++
++  const bool was_pending_req = p_device->sec_rec.pending_zero_ediv_ltk_req;
++  p_device->sec_rec.pending_zero_ediv_ltk_req = false;
++  if (p_device->sec_rec.ephemeral_ltk_req_timer != nullptr) {
++    alarm_free(p_device->sec_rec.ephemeral_ltk_req_timer);
++    p_device->sec_rec.ephemeral_ltk_req_timer = nullptr;
++  }
++  if (was_pending_req && p_device->ble_hci_handle != HCI_INVALID_HANDLE) {
++    btsnd_hcic_ble_ltk_req_neg_reply(p_device->ble_hci_handle);
++  }
++
++  p_device->sec_rec.has_ephemeral_oob_ltk = false;
++  OPENSSL_cleanse(p_device->sec_rec.ephemeral_oob_ltk.data(),
++                  p_device->sec_rec.ephemeral_oob_ltk.size());
+ }
+ 
+ static constexpr char kPropertyCtkdDisableCsrkDistribution[] =
+@@ -812,6 +884,8 @@ tBTM_BLE_SEC_REQ_ACT btm_ble_link_sec_check(const RawAddress& bd_addr, tBTM_LE_A
+     }
+   } else if (p_device->sec_rec.ble_keys.key_type & BTM_LE_KEY_PENC) {  // Bonded
+     cur_sec_level = p_device->sec_rec.ble_keys.sec_level;
++  } else if (p_device->sec_rec.has_ephemeral_oob_ltk) {
++    cur_sec_level = SMP_SEC_UNAUTHENTICATE;
+   } else {
+     cur_sec_level = SMP_SEC_NONE;
+   }
+@@ -861,8 +935,14 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr, tBTM_BLE_SEC_ACT s
+       }
+ 
+       if (link_role == HCI_ROLE_CENTRAL) {
+-        /* start link layer encryption using the security info stored */
+-        cmd = btm_ble_start_encrypt(bd_addr, false, NULL);
++        if (p_device->sec_rec.has_ephemeral_oob_ltk &&
++            !(p_device->sec_rec.ble_keys.key_type & BTM_LE_KEY_PENC)) {
++          cmd = btm_ble_start_encrypt(bd_addr, /*use_stk=*/true,
++                                      &p_device->sec_rec.ephemeral_oob_ltk);
++        } else {
++          /* start link layer encryption using the security info stored */
++          cmd = btm_ble_start_encrypt(bd_addr, false, NULL);
++        }
+         break;
+       }
+       /* if salve role then fall through to call SMP_Pair below which will send
+@@ -882,7 +962,13 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr, tBTM_BLE_SEC_ACT s
+       }
+       if (link_role == HCI_ROLE_CENTRAL) {
+         if (sec_req_act == BTM_BLE_SEC_REQ_ACT_ENCRYPT) {
+-          cmd = btm_ble_start_encrypt(bd_addr, false, NULL);
++          if (p_device->sec_rec.has_ephemeral_oob_ltk &&
++              !(p_device->sec_rec.ble_keys.key_type & BTM_LE_KEY_PENC)) {
++            cmd = btm_ble_start_encrypt(bd_addr, /*use_stk=*/true,
++                                        &p_device->sec_rec.ephemeral_oob_ltk);
++          } else {
++            cmd = btm_ble_start_encrypt(bd_addr, false, NULL);
++          }
+           break;
+         }
+       }
+@@ -912,7 +998,7 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr, tBTM_BLE_SEC_ACT s
+  *
+  ******************************************************************************/
+ void btm_ble_ltk_request(uint16_t handle, Octet8 rand, uint16_t ediv) {
+-  const BtmDevice* p_device = btm_find_dev_by_handle(handle);
++  BtmDevice* p_device = btm_get_dev_by_handle(handle);
+ 
+   BtmSecurity::Get().ediv_ = ediv;
+   BtmSecurity::Get().enc_rand_ = rand;
+@@ -925,6 +1011,32 @@ void btm_ble_ltk_request(uint16_t handle, Octet8 rand, uint16_t ediv) {
+     return;
+   }
+ 
++  if (ediv == 0 && rand == Octet8{0}) {
++    if (p_device->sec_rec.has_ephemeral_oob_ltk) {
++      log::info("Replying to zero-EDIV LTK request with ephemeral OOB LTK for {}",
++                p_device->bd_addr);
++      p_device->sec_rec.le_enc_key_size = MAX_KEY_SIZE;
++      BtmSecurity::Get().enc_handle_ = handle;
++      BtmSecurity::Get().key_size_ = MAX_KEY_SIZE;
++      btsnd_hcic_ble_ltk_req_reply(handle, p_device->sec_rec.ephemeral_oob_ltk);
++      return;
++    }
++    if (!p_device->sec_rec.is_le_link_key_known() &&
++        !(p_device->sec_rec.ble_keys.key_type & BTM_LE_KEY_LENC) &&
++        btm_find_dev_with_lenc(p_device->bd_addr) == nullptr) {
++      log::info("Holding zero-EDIV LTK request on handle 0x{:04x} awaiting ephemeral OOB LTK",
++                handle);
++      p_device->sec_rec.pending_zero_ediv_ltk_req = true;
++      if (p_device->sec_rec.ephemeral_ltk_req_timer == nullptr) {
++        p_device->sec_rec.ephemeral_ltk_req_timer = alarm_new("btm_ble.ephemeral_ltk_req_timer");
++      }
++      alarm_set_on_mloop(p_device->sec_rec.ephemeral_ltk_req_timer, kEphemeralLtkReqHoldTimeoutMs,
++                         btm_ble_ephemeral_ltk_req_timeout,
++                         reinterpret_cast<void*>(static_cast<uintptr_t>(handle)));
++      return;
++    }
++  }
++
+   log::verbose("handle 0x{:x}", handle);
+   btm_ble_ltk_request_reply(p_device->bd_addr, false, Octet16{0});
+ }
+@@ -1033,7 +1145,9 @@ void btm_ble_link_encrypted(const RawAddress& bd_addr, uint8_t encr_enable) {
+ 
+   log::verbose("p_device->sec_rec.sec_flags=0x{:x}", p_device->sec_rec.sec_flags);
+ 
+-  if (encr_enable && p_device->sec_rec.le_enc_key_size == 0) {
++  if (encr_enable && p_device->sec_rec.has_ephemeral_oob_ltk) {
++    p_device->sec_rec.le_enc_key_size = MAX_KEY_SIZE;
++  } else if (encr_enable && p_device->sec_rec.le_enc_key_size == 0) {
+     p_device->sec_rec.le_enc_key_size = p_device->sec_rec.ble_keys.key_size;
+   }
+ 
+diff --git a/system/stack/btm/btm_ble_sec.h b/system/stack/btm/btm_ble_sec.h
+index c61c78d..d3a9ce5 100644
+--- a/system/stack/btm/btm_ble_sec.h
++++ b/system/stack/btm/btm_ble_sec.h
+@@ -74,3 +74,5 @@ bool btm_ble_verify_signature(const RawAddress& bd_addr, uint8_t* p_orig, uint16
+ std::optional<Octet16> btm_ble_get_peer_ltk(const RawAddress address);
+ std::optional<Octet16> btm_ble_get_peer_irk(const RawAddress address);
+ std::optional<tBLE_BD_ADDR> btm_ble_get_identity_address(const RawAddress address);
++void btm_ble_set_ephemeral_oob_ltk(const RawAddress& bd_addr, const Octet16& ltk);
++void btm_ble_clear_ephemeral_oob_ltk(const RawAddress& bd_addr);
+diff --git a/system/stack/btm/btm_sec.cc b/system/stack/btm/btm_sec.cc
+index 2ccbbcc..e19fcea 100644
+--- a/system/stack/btm/btm_sec.cc
++++ b/system/stack/btm/btm_sec.cc
+@@ -3266,6 +3266,9 @@ void btm_sec_encrypt_change(uint16_t handle, tHCI_STATUS status, uint8_t encr_en
+ 
+   if (transport == BT_TRANSPORT_LE) {
+     key_size = p_device->sec_rec.ble_keys.key_size;
++    if (key_size == 0 && p_device->sec_rec.has_ephemeral_oob_ltk) {
++      key_size = MAX_KEY_SIZE;
++    }
+     if (key_size == 0 && status == HCI_SUCCESS && encr_enable == HCI_ENCRYPT_MODE_ON) {
+       /* Only case when key size is 0 during successfull encryption is pairing - for this case look
+        * up the key size */
+@@ -3962,6 +3965,13 @@ void btm_sec_disconnected(uint16_t handle, tHCI_REASON reason, std::string comme
+             ~(BTM_SEC_LE_AUTHENTICATED | BTM_SEC_LE_ENCRYPTED | BTM_SEC_ROLE_SWITCHED);
+     p_device->sec_rec.le_enc_key_size = 0;
+     p_device->suggested_tx_octets = 0;
++    if (p_device->sec_rec.ephemeral_ltk_req_timer != nullptr) {
++      alarm_free(p_device->sec_rec.ephemeral_ltk_req_timer);
++      p_device->sec_rec.ephemeral_ltk_req_timer = nullptr;
++    }
++    p_device->sec_rec.has_ephemeral_oob_ltk = false;
++    p_device->sec_rec.pending_zero_ediv_ltk_req = false;
++    p_device->sec_rec.ephemeral_oob_ltk.fill(0);
+ 
+     if ((p_device->sec_rec.sec_flags & BTM_SEC_LE_LINK_KEY_KNOWN) == 0) {
+       p_device->sec_rec.sec_flags &= ~(BTM_SEC_LE_LINK_KEY_AUTHED | BTM_SEC_LE_AUTHENTICATED);
+diff --git a/system/stack/btm/btm_sec.h b/system/stack/btm/btm_sec.h
+index e1d0f80..1792dc1 100644
+--- a/system/stack/btm/btm_sec.h
++++ b/system/stack/btm/btm_sec.h
+@@ -64,6 +64,7 @@ bool btm_sec_register(const BtmAppReg& app_reg);
+ bool btm_is_encrypted(const RawAddress& bd_addr, tBT_TRANSPORT transport);
+ bool btm_is_link_key_authed(const RawAddress& bd_addr, tBT_TRANSPORT transport);
+ bool btm_is_authenticated(const RawAddress& bd_addr, tBT_TRANSPORT transport);
++bool btm_ble_has_ephemeral_oob_ltk(const RawAddress& bd_addr);
+ 
+ /*******************************************************************************
+  *
+diff --git a/system/stack/btm/btm_security_record.h b/system/stack/btm/btm_security_record.h
+index 9dc800d..f25c570 100644
+--- a/system/stack/btm/btm_security_record.h
++++ b/system/stack/btm/btm_security_record.h
+@@ -29,6 +29,8 @@
+ #include "stack/include/btm_sec_api_types.h"
+ #include "stack/include/hci_error_code.h"
+ 
++struct alarm_t;
++
+ /*
+  * Define structure for Security Service Record.
+  * A record exists for each service registered with the Security Manager
+@@ -194,6 +196,12 @@ struct BtmSecurityRecord {
+   tBTM_SEC_BLE_KEYS ble_keys;
+   PairingAlgorithm ble_pairing_algorithm; /* The pairing algorithm used for LE pairing */
+ 
++  // Out-of-band ephemeral LTK for unbonded LE Channel Sounding (EDIV = 0, Rand = 0)
++  bool has_ephemeral_oob_ltk{false};
++  Octet16 ephemeral_oob_ltk{};
++  bool pending_zero_ediv_ltk_req{false};
++  alarm_t* ephemeral_ltk_req_timer{nullptr};
++
+ public:
+   bool is_device_authenticated() const { return sec_flags & BTM_SEC_AUTHENTICATED; }
+   void set_device_authenticated() { sec_flags |= BTM_SEC_AUTHENTICATED; }
+diff --git a/system/stack/gatt/gatt_auth.cc b/system/stack/gatt/gatt_auth.cc
+index f0cd222..2da3cb8 100644
+--- a/system/stack/gatt/gatt_auth.cc
++++ b/system/stack/gatt/gatt_auth.cc
+@@ -290,7 +290,9 @@ static tGATT_SEC_ACTION gatt_determine_sec_act(tGATT_CLCB* p_clcb) {
+   }
+ 
+   is_link_key_known = get_security_client_interface().BTM_IsBonded(p_tcb->peer_bda,
+-                                                                       p_clcb->p_tcb->transport);
++                                                                   p_clcb->p_tcb->transport) ||
++                      (p_clcb->p_tcb->transport == BT_TRANSPORT_LE &&
++                       btm_ble_has_ephemeral_oob_ltk(p_tcb->peer_bda));
+   is_link_encrypted = get_security_client_interface().BTM_IsEncrypted(p_tcb->peer_bda,
+                                                                           p_clcb->p_tcb->transport);
+   is_key_mitm = btm_is_link_key_authed(p_tcb->peer_bda, p_clcb->p_tcb->transport);
+@@ -356,7 +358,8 @@ tGATT_STATUS gatt_get_link_encrypt_status(tGATT_TCB& tcb) {
+ 
+   bool encrypted = get_security_client_interface().BTM_IsEncrypted(tcb.peer_bda, tcb.transport);
+   bool link_key_known =
+-          get_security_client_interface().BTM_IsBonded(tcb.peer_bda, tcb.transport);
++          get_security_client_interface().BTM_IsBonded(tcb.peer_bda, tcb.transport) ||
++          (tcb.transport == BT_TRANSPORT_LE && btm_ble_has_ephemeral_oob_ltk(tcb.peer_bda));
+   bool link_key_authed = btm_is_link_key_authed(tcb.peer_bda, tcb.transport);
+ 
+   if (encrypted && link_key_known) {
+diff --git a/system/stack/gatt/gatt_utils.cc b/system/stack/gatt/gatt_utils.cc
+index 4c11695..366caf5 100644
+--- a/system/stack/gatt/gatt_utils.cc
++++ b/system/stack/gatt/gatt_utils.cc
+@@ -880,7 +880,9 @@ std::list<tGATT_SRV_LIST_ELEM>::iterator gatt_sr_find_i_rcb_by_handle(uint16_t h
+ void gatt_sr_get_sec_info(const RawAddress& rem_bda, tBT_TRANSPORT transport,
+                           tGATT_SEC_FLAG* p_sec_flag, uint8_t* p_key_size) {
+   tGATT_SEC_FLAG flags = {};
+-  flags.is_link_key_known = get_security_client_interface().BTM_IsBonded(rem_bda, transport);
++  flags.is_link_key_known = get_security_client_interface().BTM_IsBonded(rem_bda, transport) ||
++                            (transport == BT_TRANSPORT_LE &&
++                             btm_ble_has_ephemeral_oob_ltk(rem_bda));
+   flags.is_link_key_authed = btm_is_link_key_authed(rem_bda, transport);
+   flags.is_encrypted = get_security_client_interface().BTM_IsEncrypted(rem_bda, transport);
+   flags.can_read_discoverable_characteristics = BTM_CanReadDiscoverableCharacteristics(rem_bda);
+diff --git a/system/stack/mock/mock_stack_btm_sec.cc b/system/stack/mock/mock_stack_btm_sec.cc
+index 93e0bb8..0e7f43b 100644
+--- a/system/stack/mock/mock_stack_btm_sec.cc
++++ b/system/stack/mock/mock_stack_btm_sec.cc
+@@ -166,6 +166,10 @@ bool btm_is_link_key_authed(const RawAddress& bd_addr, tBT_TRANSPORT transport)
+   inc_func_call_count(__func__);
+   return test::mock::stack_btm_sec::btm_is_link_key_authed(bd_addr, transport);
+ }
++bool btm_ble_has_ephemeral_oob_ltk(const RawAddress& /*bd_addr*/) {
++  inc_func_call_count(__func__);
++  return false;
++}
+ bool btm_is_bonded(const RawAddress& bd_addr, tBT_TRANSPORT transport) {
+   inc_func_call_count(__func__);
+   return test::mock::stack_btm_sec::btm_is_bonded(bd_addr, transport);

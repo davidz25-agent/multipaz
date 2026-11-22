@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.io.bytestring.ByteString
 import org.multipaz.cbor.Cbor
 import org.multipaz.cbor.CborMap
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.role.MdocRole
 import org.multipaz.nfc.NfcDeactivationReason
@@ -86,6 +87,10 @@ class NfcCceTransportMdoc(
     private var transportReady = false
     private var transportMessageBacklog = mutableListOf<ByteString>()
     private var transportListenMessageJob: Job? = null
+    @Volatile
+    private var pendingBleLtk: SecretKey? = null
+    @Volatile
+    private var pendingBleLtkCallback: (BleChannelSoundingResult) -> Unit = {}
 
     @Volatile
     private var disconnectNfcSent = false
@@ -249,6 +254,27 @@ class NfcCceTransportMdoc(
         if (shouldClose) {
             listenJob.cancel()
             transport.close()
+        } else {
+            pendingBleLtk?.let { ltk ->
+                if (!ltk.isDestroyed) {
+                    transport.startBleChannelSounding(ltk, pendingBleLtkCallback)
+                }
+            }
+        }
+    }
+
+    override fun startBleChannelSounding(
+        bleLtk: SecretKey,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        bleLtk.checkNotDestroyed()
+        val ltkCopy = SecretKey(bleLtk)
+        val prev = pendingBleLtk
+        pendingBleLtk = ltkCopy
+        pendingBleLtkCallback = onResult
+        prev?.close()
+        if (!ltkCopy.isDestroyed) {
+            transport?.startBleChannelSounding(ltkCopy, onResult)
         }
     }
 
@@ -535,6 +561,9 @@ class NfcCceTransportMdoc(
             }
             transport = null
             transportReady = false
+            pendingBleLtk?.close()
+            pendingBleLtk = null
+            pendingBleLtkCallback = {}
             if (_state.value != State.FAILED) {
                 _state.value = State.CLOSED
             }
@@ -550,6 +579,9 @@ class NfcCceTransportMdoc(
             return
         }
         Logger.w(TAG, "Failing transport with error", error)
+        pendingBleLtk?.close()
+        pendingBleLtk = null
+        pendingBleLtkCallback = {}
         incomingMessages.close(error)
         _state.value = State.FAILED
     }

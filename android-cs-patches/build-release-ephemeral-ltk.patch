@@ -1,0 +1,48 @@
+diff --git a/aconfig/cp2a/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto b/aconfig/cp2a/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto
+new file mode 100644
+index 0000000..6745133
+--- /dev/null
++++ b/aconfig/cp2a/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto
+@@ -0,0 +1,6 @@
++flag_value {
++  package: "com.android.bluetooth.flags"
++  name: "channel_sounding_ephemeral_ltk"
++  state: ENABLED
++  permission: READ_ONLY
++}
+diff --git a/aconfig/cp2a/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto b/aconfig/cp2a/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto
+new file mode 100644
+index 0000000..05154be
+--- /dev/null
++++ b/aconfig/cp2a/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto
+@@ -0,0 +1,6 @@
++flag_value {
++  package: "com.android.ranging.flags"
++  name: "ranging_cs_ephemeral_ltk"
++  state: ENABLED
++  permission: READ_ONLY
++}
+diff --git a/aconfig/trunk_staging/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto b/aconfig/trunk_staging/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto
+new file mode 100644
+index 0000000..6745133
+--- /dev/null
++++ b/aconfig/trunk_staging/com.android.bluetooth.flags/channel_sounding_ephemeral_ltk_flag_values.textproto
+@@ -0,0 +1,6 @@
++flag_value {
++  package: "com.android.bluetooth.flags"
++  name: "channel_sounding_ephemeral_ltk"
++  state: ENABLED
++  permission: READ_ONLY
++}
+diff --git a/aconfig/trunk_staging/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto b/aconfig/trunk_staging/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto
+new file mode 100644
+index 0000000..05154be
+--- /dev/null
++++ b/aconfig/trunk_staging/com.android.ranging.flags/ranging_cs_ephemeral_ltk_flag_values.textproto
+@@ -0,0 +1,6 @@
++flag_value {
++  package: "com.android.ranging.flags"
++  name: "ranging_cs_ephemeral_ltk"
++  state: ENABLED
++  permission: READ_ONLY
++}

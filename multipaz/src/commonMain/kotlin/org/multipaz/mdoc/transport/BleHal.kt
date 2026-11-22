@@ -2,6 +2,7 @@ package org.multipaz.mdoc.transport
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.io.IOException
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.role.MdocRole
@@ -181,6 +182,34 @@ interface BleCentralHal {
     /** Cleans up any partially established L2CAP channel attempt before retrying. */
     fun closeConnectedL2capAttempt()
 
+    /**
+     * Checks whether Bluetooth Channel Sounding (CS) is supported and available on this HAL.
+     *
+     * @return `true` if Bluetooth Channel Sounding is supported, enabled, and ready to use; `false`
+     *   otherwise.
+     */
+    suspend fun isChannelSoundingAvailable(): Boolean = false
+
+    /**
+     * Starts a Bluetooth Channel Sounding (CS) ranging session on the active connection and
+     * suspends until cancelled or the connection closes.
+     *
+     * Implementations that do not support Channel Sounding return immediately.
+     *
+     * @param asInitiator `true` if this device acts as the Channel Sounding initiator (computing
+     *   distance measurements), or `false` if it acts as the responder.
+     * @param ephemeralLtk the 16-byte out-of-band ephemeral BLE Long Term Key (`BLELTK`) used to
+     *   encrypt an unbonded BLE connection (`EDIV = 0`, `Rand = 0`) prior to Channel Sounding, or
+     *   `null` when relying on an existing Bluetooth bond.
+     * @param onResult callback invoked with each [BleChannelSoundingResult] produced during the
+     *   ranging session.
+     */
+    suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit = {},
+    ) {}
+
     /** Gracefully shuts down active BLE central connections/controllers before [close]. */
     suspend fun shutdown() {}
 
@@ -284,6 +313,34 @@ interface BlePeripheralHal {
 
     /** Sends a GATT notification with [value] for characteristic [uuid]. */
     fun notifyCharacteristicChanged(uuid: UUID, value: ByteArray)
+
+    /**
+     * Checks whether Bluetooth Channel Sounding (CS) is supported and available on this HAL.
+     *
+     * @return `true` if Bluetooth Channel Sounding is supported, enabled, and ready to use; `false`
+     *   otherwise.
+     */
+    suspend fun isChannelSoundingAvailable(): Boolean = false
+
+    /**
+     * Starts a Bluetooth Channel Sounding (CS) ranging session on the active connection and
+     * suspends until cancelled or the connection closes.
+     *
+     * Implementations that do not support Channel Sounding return immediately.
+     *
+     * @param asInitiator `true` if this device acts as the Channel Sounding initiator (computing
+     *   distance measurements), or `false` if it acts as the responder.
+     * @param ephemeralLtk the 16-byte out-of-band ephemeral BLE Long Term Key (`BLELTK`) used to
+     *   encrypt an unbonded BLE connection (`EDIV = 0`, `Rand = 0`) prior to Channel Sounding, or
+     *   `null` when relying on an existing Bluetooth bond.
+     * @param onResult callback invoked with each [BleChannelSoundingResult] produced during the
+     *   ranging session.
+     */
+    suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit = {},
+    ) {}
 
     /** Gracefully shuts down active BLE peripheral connections/controllers before [close]. */
     suspend fun shutdown() {}
@@ -420,6 +477,7 @@ private sealed interface CoalescedTransportSpec {
     data class DualBlePeripheral(
         val uuid: UUID,
         val peripheralAddress: BlePeripheralAddress?,
+        val bleChannelSoundingAvailable: Boolean,
     ) : CoalescedTransportSpec
     data class ReadyNonBle(val transport: MdocTransport) : CoalescedTransportSpec
 }
@@ -472,6 +530,7 @@ internal fun createMdocTransportsFromManagers(
                 CoalescedTransportSpec.DualBlePeripheral(
                     uuid = uuid,
                     peripheralAddress = connectionMethod.peripheralAddress ?: partner.peripheralAddress,
+                    bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
                 )
             )
         } else {
@@ -503,6 +562,7 @@ internal fun createMdocTransportsFromManagers(
                     gattEnabled = true,
                     directL2capEnabled = true,
                     configuredPeripheralAddress = spec.peripheralAddress,
+                    bleChannelSoundingAvailable = spec.bleChannelSoundingAvailable,
                 )
                 MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
                     role = role,
@@ -512,6 +572,7 @@ internal fun createMdocTransportsFromManagers(
                     gattEnabled = true,
                     directL2capEnabled = true,
                     configuredPeripheralAddress = spec.peripheralAddress,
+                    bleChannelSoundingAvailable = spec.bleChannelSoundingAvailable,
                 )
             }
             is CoalescedTransportSpec.SingleBle -> createSingleBleTransportFromManagers(
@@ -548,7 +609,8 @@ private fun findCoHostedBlePeripheralPartnerIndex(
         }
         if (candidateIsSamePeripheralRole &&
             candidate.uuid == uuid &&
-            candidate.isDirectL2cap != ble.isDirectL2cap
+            candidate.isDirectL2cap != ble.isDirectL2cap &&
+            candidate.bleChannelSoundingAvailable == ble.bleChannelSoundingAvailable
         ) {
             return candidateIndex
         }
@@ -572,6 +634,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             psm = null,
             peripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
             role = role,
@@ -581,6 +644,7 @@ private fun createSingleBleTransportFromManagers(
             gattEnabled = true,
             directL2capEnabled = false,
             configuredPeripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.DirectL2capCentral -> when (role) {
@@ -591,6 +655,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             psm = connectionMethod.psm!!,
             peripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportCentralMdocReader(
             role = role,
@@ -600,6 +665,7 @@ private fun createSingleBleTransportFromManagers(
             gattEnabled = false,
             directL2capEnabled = true,
             configuredPeripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.GattPeripheral -> when (role) {
@@ -611,6 +677,7 @@ private fun createSingleBleTransportFromManagers(
             gattEnabled = true,
             directL2capEnabled = false,
             configuredPeripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportPeripheralMdocReader(
             role = role,
@@ -619,6 +686,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             psm = null,
             peripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
     }
     is MdocConnectionMethod.Ble.DirectL2capPeripheral -> when (role) {
@@ -630,6 +698,7 @@ private fun createSingleBleTransportFromManagers(
             gattEnabled = false,
             directL2capEnabled = true,
             configuredPeripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
         MdocRole.MDOC_READER -> BleTransportPeripheralMdocReader(
             role = role,
@@ -638,6 +707,7 @@ private fun createSingleBleTransportFromManagers(
             uuid = uuid,
             psm = connectionMethod.psm!!,
             peripheralAddress = connectionMethod.peripheralAddress,
+            bleChannelSoundingAvailable = connectionMethod.bleChannelSoundingAvailable,
         )
     }
 }

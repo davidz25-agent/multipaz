@@ -3,6 +3,7 @@ package org.multipaz.mdoc.transport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.io.bytestring.ByteString
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.role.MdocRole
 import kotlin.time.Duration
@@ -166,6 +167,24 @@ abstract class MdocTransport {
      * This is idempotent and can be called from any thread.
      */
     abstract suspend fun close()
+
+    /**
+     * Provisions the 16-byte ephemeral Bluetooth LE Long Term Key (`BLELTK`) derived for the
+     * current session and starts Bluetooth Channel Sounding ranging if supported and advertised on
+     * this transport.
+     *
+     * Implementations copy any key material they need before returning, so callers may close
+     * [bleLtk] immediately after this method returns. Non-BLE transports or BLE transports without
+     * Channel Sounding enabled ignore this call.
+     *
+     * @param bleLtk the 16-byte ephemeral `BLELTK` derived from the session key agreement and
+     *   `SessionTranscript`.
+     * @param onResult callback invoked as [BleChannelSoundingResult] distance measurements arrive.
+     */
+    open fun startBleChannelSounding(
+        bleLtk: SecretKey,
+        onResult: (BleChannelSoundingResult) -> Unit = {},
+    ) {}
 
     /**
      * Wraps this [Throwable] as an [MdocTransportException] unless it's a [CancellationException].

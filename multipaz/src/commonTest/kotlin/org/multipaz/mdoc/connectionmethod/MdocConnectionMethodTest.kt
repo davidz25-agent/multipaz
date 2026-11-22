@@ -658,4 +658,202 @@ class MdocConnectionMethodTest {
             )
         }
     }
+
+    @Test
+    fun testConnectionMethodBleChannelSounding() {
+        val uuid = UUID(0U, 1U)
+        val uuid2 = UUID(0U, 2U)
+        val cm = MdocConnectionMethod.Ble.GattPeripheral(
+            uuid = uuid,
+            bleChannelSoundingAvailable = true,
+        )
+        assertEquals("ble:gatt_peripheral:uuid=$uuid:cs=true", cm.toString())
+        assertTrue(cm.withUuid(uuid2).bleChannelSoundingAvailable)
+
+        val decoded = MdocConnectionMethod.fromDeviceEngagement(cm.toDeviceEngagement())
+        assertEquals(listOf(cm), decoded)
+        assertEquals(
+            """[
+  2,
+  1,
+  {
+    0: true,
+    1: false,
+    10: h'00000000000000000000000000000001',
+    42: true
+  }
+]""",
+            Cbor.toDiagnostics(cm.toDeviceEngagement(), setOf(DiagnosticOption.PRETTY_PRINT))
+        )
+
+        // Coalesced Reader QR modes with bleChannelSoundingAvailable = true
+        val readerMethods = listOf(
+            MdocConnectionMethod.Ble.DirectL2capCentral(
+                uuid = uuid2,
+                psm = 128,
+                bleChannelSoundingAvailable = true,
+            ),
+            MdocConnectionMethod.Ble.GattCentral(
+                uuid = uuid2,
+                bleChannelSoundingAvailable = true,
+            ),
+        )
+        val encodedReaderItems = MdocConnectionMethod.encodeDeviceRetrievalMethods(
+            methods = readerMethods,
+            engagementType = MdocEngagementType.READER_QR,
+        )
+        assertEquals(
+            """[
+  2,
+  1,
+  {
+    0: false,
+    1: true,
+    2: false,
+    3: true,
+    11: h'00000000000000000000000000000002',
+    21: 128,
+    42: true
+  }
+]""",
+            Cbor.toDiagnostics(Cbor.encode(encodedReaderItems.single()), setOf(DiagnosticOption.PRETTY_PRINT))
+        )
+        assertEquals(
+            readerMethods,
+            MdocConnectionMethod.decodeDeviceRetrievalMethods(
+                items = encodedReaderItems,
+                senderRole = MdocRole.MDOC_READER,
+            )
+        )
+
+        // Conflicting bleChannelSoundingAvailable across coalesced BLE modes is rejected
+        assertFailsWith<IllegalArgumentException> {
+            MdocConnectionMethod.encodeDeviceRetrievalMethods(
+                methods = listOf(
+                    MdocConnectionMethod.Ble.GattPeripheral(uuid = uuid, bleChannelSoundingAvailable = true),
+                    MdocConnectionMethod.Ble.GattCentral(uuid = uuid2, bleChannelSoundingAvailable = false),
+                ),
+                engagementType = MdocEngagementType.DEVICE_QR,
+            )
+        }
+    }
+
+    @Test
+    fun testBleNdefHandoverCarrierChannelSounding() {
+        val centralUuid = UUID.fromString("00000001-a123-48ce-896b-4c76973373e6")
+        val peripheralUuid = UUID.fromString("00000002-a123-48ce-896b-4c76973373e6")
+
+        // 1. GATT-only Static Hs with bleChannelSoundingAvailable = true emits ChBleOptions with key 42
+        val staticGattCs = listOf(
+            MdocConnectionMethod.Ble.GattPeripheral(
+                uuid = peripheralUuid,
+                bleChannelSoundingAvailable = true,
+            )
+        )
+        val hsStaticCs = MdocConnectionMethod.encodeNdefHandoverCarriers(
+            methods = staticGattCs,
+            handoverType = MdocNfcHandoverType.STATIC_HS,
+            sharedAuxiliaryReferences = listOf("mdoc"),
+        ).single()
+        assertEquals(listOf("mdoc", "chble"), hsStaticCs.alternativeCarrierRecord.auxiliaryDataReferences)
+        assertEquals(
+            """{
+  1: true,
+  2: false,
+  42: true
+}""",
+            Cbor.toDiagnostics(
+                hsStaticCs.auxiliaryRecords.single().payload.toByteArray(),
+                setOf(DiagnosticOption.PRETTY_PRINT)
+            )
+        )
+        assertEquals(
+            staticGattCs,
+            MdocConnectionMethod.decodeNdefHandoverCarrier(
+                record = hsStaticCs.carrierRecord,
+                senderRole = MdocRole.MDOC,
+                fallbackUuid = null,
+                auxiliaryRecords = hsStaticCs.auxiliaryRecords,
+            )
+        )
+
+        // 2. Negotiated Hr with DirectL2capCentral + GattCentral + bleChannelSoundingAvailable = true
+        val readerOfferCs = listOf(
+            MdocConnectionMethod.Ble.DirectL2capCentral(
+                uuid = centralUuid,
+                psm = 128,
+                bleChannelSoundingAvailable = true,
+            ),
+            MdocConnectionMethod.Ble.GattCentral(
+                uuid = centralUuid,
+                bleChannelSoundingAvailable = true,
+            ),
+        )
+        val hrRecordsCs = MdocConnectionMethod.encodeNdefHandoverCarriers(
+            methods = readerOfferCs,
+            handoverType = MdocNfcHandoverType.NEGOTIATED_HR,
+            sharedAuxiliaryReferences = listOf("mdocreader"),
+        ).single()
+        assertEquals(
+            """{
+  0: 128,
+  1: true,
+  2: true,
+  42: true
+}""",
+            Cbor.toDiagnostics(
+                hrRecordsCs.auxiliaryRecords.single().payload.toByteArray(),
+                setOf(DiagnosticOption.PRETTY_PRINT)
+            )
+        )
+        assertEquals(
+            readerOfferCs,
+            MdocConnectionMethod.decodeNdefHandoverCarrier(
+                record = hrRecordsCs.carrierRecord,
+                senderRole = MdocRole.MDOC_READER,
+                fallbackUuid = null,
+                auxiliaryRecords = hrRecordsCs.auxiliaryRecords,
+            )
+        )
+
+        // 3. Negotiated Hs selecting DirectL2capCentral with bleChannelSoundingAvailable = true
+        val hsSelectCs = MdocConnectionMethod.encodeNdefHandoverCarriers(
+            methods = listOf(
+                MdocConnectionMethod.Ble.DirectL2capCentral(
+                    uuid = centralUuid,
+                    psm = 128,
+                    bleChannelSoundingAvailable = true,
+                )
+            ),
+            handoverType = MdocNfcHandoverType.NEGOTIATED_HS,
+            sharedAuxiliaryReferences = listOf("mdoc"),
+            hrHadChBleOptions = true,
+        ).single()
+        assertEquals(
+            """{
+  1: false,
+  2: true,
+  42: true
+}""",
+            Cbor.toDiagnostics(
+                hsSelectCs.auxiliaryRecords.single().payload.toByteArray(),
+                setOf(DiagnosticOption.PRETTY_PRINT)
+            )
+        )
+        assertEquals(
+            listOf(
+                MdocConnectionMethod.Ble.DirectL2capCentral(
+                    uuid = centralUuid,
+                    psm = null,
+                    bleChannelSoundingAvailable = true,
+                )
+            ),
+            MdocConnectionMethod.decodeNdefHandoverCarrier(
+                record = hsSelectCs.carrierRecord,
+                senderRole = MdocRole.MDOC,
+                fallbackUuid = centralUuid,
+                auxiliaryRecords = hsSelectCs.auxiliaryRecords,
+            )
+        )
+    }
 }

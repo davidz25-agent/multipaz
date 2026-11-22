@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.io.bytestring.ByteString
 import kotlinx.io.bytestring.ByteStringBuilder
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.util.Logger
 import org.multipaz.util.UUID
@@ -525,6 +526,14 @@ internal class BlePeripheralManagerImpl(
             }
         }
         Logger.i(TAG, "sendMessage completed")
+    }
+
+    override suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        hal.startChannelSounding(asInitiator, ephemeralLtk, onResult)
     }
 
     override suspend fun shutdown() {

@@ -1,0 +1,395 @@
+diff --git a/ranging/flags/ranging_flags.aconfig b/ranging/flags/ranging_flags.aconfig
+index a7f7485..a7e1a12 100644
+--- a/ranging/flags/ranging_flags.aconfig
++++ b/ranging/flags/ranging_flags.aconfig
+@@ -49,3 +49,11 @@ flag {
+     description: "This flags controls updates to ranging stack for 26Q2"
+     bug: "433583754"
+ }
++
++flag {
++    name: "ranging_cs_ephemeral_ltk"
++    is_exported: true
++    namespace: "uwb"
++    description: "Support out-of-band ephemeral LTK for unbonded BLE Channel Sounding"
++    bug: "331206299"
++}
+diff --git a/ranging/framework/api/current.txt b/ranging/framework/api/current.txt
+index b1dd2d4..117e2b7 100644
+--- a/ranging/framework/api/current.txt
++++ b/ranging/framework/api/current.txt
+@@ -317,6 +317,7 @@ package android.ranging.ble.cs {
+ 
+   @FlaggedApi("com.android.ranging.flags.ranging_cs_enabled") public final class BleCsRangingParams implements android.os.Parcelable {
+     method public int describeContents();
++    method @FlaggedApi("com.android.ranging.flags.ranging_cs_ephemeral_ltk") @Nullable public byte[] getEphemeralLtk();
+     method public int getLocationType();
+     method @NonNull public String getPeerBluetoothAddress();
+     method public int getRangingUpdateRate();
+@@ -335,6 +336,7 @@ package android.ranging.ble.cs {
+   @FlaggedApi("com.android.ranging.flags.ranging_cs_enabled") public static final class BleCsRangingParams.Builder {
+     ctor public BleCsRangingParams.Builder(@NonNull String);
+     method @NonNull public android.ranging.ble.cs.BleCsRangingParams build();
++    method @FlaggedApi("com.android.ranging.flags.ranging_cs_ephemeral_ltk") @NonNull public android.ranging.ble.cs.BleCsRangingParams.Builder setEphemeralLtk(@Nullable byte[]);
+     method @NonNull public android.ranging.ble.cs.BleCsRangingParams.Builder setLocationType(int);
+     method @NonNull public android.ranging.ble.cs.BleCsRangingParams.Builder setRangingUpdateRate(int);
+     method @NonNull public android.ranging.ble.cs.BleCsRangingParams.Builder setSecurityLevel(int);
+diff --git a/ranging/framework/java/android/ranging/ble/cs/BleCsRangingParams.java b/ranging/framework/java/android/ranging/ble/cs/BleCsRangingParams.java
+index 4e526ef..ffb81e7 100644
+--- a/ranging/framework/java/android/ranging/ble/cs/BleCsRangingParams.java
++++ b/ranging/framework/java/android/ranging/ble/cs/BleCsRangingParams.java
+@@ -21,6 +21,7 @@ import static android.ranging.raw.RawRangingDevice.UPDATE_RATE_NORMAL;
+ import android.annotation.FlaggedApi;
+ import android.annotation.IntDef;
+ import android.annotation.NonNull;
++import android.annotation.Nullable;
+ import android.os.Parcel;
+ import android.os.Parcelable;
+ import android.ranging.raw.RawRangingDevice;
+@@ -30,6 +31,7 @@ import com.android.ranging.flags.Flags;
+ 
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
++import java.util.Arrays;
+ import java.util.Objects;
+ 
+ /**
+@@ -97,6 +99,8 @@ public final class BleCsRangingParams implements Parcelable {
+     private final int mLocationType;
+     @BleCsRangingCapabilities.SecurityLevel
+     private final int mSecurityLevel;
++    @Nullable
++    private final byte[] mEphemeralLtk;
+ 
+     private BleCsRangingParams(Builder builder) {
+         mPeerBluetoothAddress = builder.mPeerBluetoothAddress;
+@@ -104,6 +108,7 @@ public final class BleCsRangingParams implements Parcelable {
+         mSightType = builder.mSightType;
+         mLocationType = builder.mLocationType;
+         mSecurityLevel = builder.mSecurityLevel;
++        mEphemeralLtk = builder.mEphemeralLtk == null ? null : builder.mEphemeralLtk.clone();
+     }
+ 
+     private BleCsRangingParams(Parcel in) {
+@@ -112,6 +117,7 @@ public final class BleCsRangingParams implements Parcelable {
+         mSightType = in.readInt();
+         mLocationType = in.readInt();
+         mSecurityLevel = in.readInt();
++        mEphemeralLtk = in.createByteArray();
+     }
+ 
+     @Override
+@@ -121,6 +127,7 @@ public final class BleCsRangingParams implements Parcelable {
+         dest.writeInt(mSightType);
+         dest.writeInt(mLocationType);
+         dest.writeInt(mSecurityLevel);
++        dest.writeByteArray(mEphemeralLtk);
+     }
+ 
+     @NonNull
+@@ -187,6 +194,19 @@ public final class BleCsRangingParams implements Parcelable {
+         return mSecurityLevel;
+     }
+ 
++    /**
++     * Returns the 16-byte out-of-band ephemeral Long Term Key (LTK) used to encrypt an unbonded
++     * BLE connection for Channel Sounding (such as {@code BLELTK} in ISO/IEC 18013-5), or
++     * {@code null} when relying on an existing BLE bond.
++     *
++     * @return a copy of the 16-byte ephemeral LTK, or {@code null} if not set.
++     */
++    @FlaggedApi(Flags.FLAG_RANGING_CS_EPHEMERAL_LTK)
++    @Nullable
++    public byte[] getEphemeralLtk() {
++        return mEphemeralLtk == null ? null : mEphemeralLtk.clone();
++    }
++
+     /**
+      * Builder class to create {@link BleCsRangingParams} instances.
+      */
+@@ -200,6 +220,8 @@ public final class BleCsRangingParams implements Parcelable {
+         private int mLocationType = LOCATION_TYPE_UNKNOWN;
+         @BleCsRangingCapabilities.SecurityLevel
+         private int mSecurityLevel = BleCsRangingCapabilities.CS_SECURITY_LEVEL_ONE;
++        @Nullable
++        private byte[] mEphemeralLtk = null;
+ 
+         /**
+          * Constructs a new {@link Builder} for creating a channel sounding ranging session.
+@@ -276,6 +298,27 @@ public final class BleCsRangingParams implements Parcelable {
+             return this;
+         }
+ 
++        /**
++         * Sets a 16-byte out-of-band ephemeral Long Term Key (LTK) used to encrypt an unbonded
++         * BLE connection for Channel Sounding (such as {@code BLELTK} in ISO/IEC 18013-5 with
++         * {@code EDIV = 0} and {@code Rand = 0}).
++         * <p>Defaults to {@code null}, which requires an existing BLE bond.
++         *
++         * @param ephemeralLtk 16-byte ephemeral LTK, or {@code null} to require a BLE bond.
++         * @return this {@link Builder} instance.
++         * @throws IllegalArgumentException if {@code ephemeralLtk} is non-null and not 16 bytes.
++         */
++        @FlaggedApi(Flags.FLAG_RANGING_CS_EPHEMERAL_LTK)
++        @NonNull
++        public Builder setEphemeralLtk(@Nullable byte[] ephemeralLtk) {
++            if (ephemeralLtk != null && ephemeralLtk.length != 16) {
++                throw new IllegalArgumentException(
++                        "Ephemeral LTK must be 16 bytes, got " + ephemeralLtk.length);
++            }
++            mEphemeralLtk = ephemeralLtk == null ? null : ephemeralLtk.clone();
++            return this;
++        }
++
+         /**
+          * Builds and returns a {@link BleCsRangingParams} instance.
+          *
+@@ -301,7 +344,8 @@ public final class BleCsRangingParams implements Parcelable {
+         if (!(o instanceof BleCsRangingParams that)) return false;
+         return mRangingUpdateRate == that.mRangingUpdateRate && mSightType == that.mSightType
+                 && mLocationType == that.mLocationType && mSecurityLevel == that.mSecurityLevel
+-                && Objects.equals(mPeerBluetoothAddress, that.mPeerBluetoothAddress);
++                && Objects.equals(mPeerBluetoothAddress, that.mPeerBluetoothAddress)
++                && Arrays.equals(mEphemeralLtk, that.mEphemeralLtk);
+     }
+ 
+     /**
+@@ -309,8 +353,9 @@ public final class BleCsRangingParams implements Parcelable {
+      */
+     @Override
+     public int hashCode() {
+-        return Objects.hash(mPeerBluetoothAddress, mRangingUpdateRate, mSightType, mLocationType,
+-                mSecurityLevel);
++        int result = Objects.hash(mPeerBluetoothAddress, mRangingUpdateRate, mSightType,
++                mLocationType, mSecurityLevel);
++        return 31 * result + Arrays.hashCode(mEphemeralLtk);
+     }
+ }
+ 
+diff --git a/ranging/service/java/com/android/server/ranging/RangingInjector.java b/ranging/service/java/com/android/server/ranging/RangingInjector.java
+index 73fdd37..e4d0d8b 100644
+--- a/ranging/service/java/com/android/server/ranging/RangingInjector.java
++++ b/ranging/service/java/com/android/server/ranging/RangingInjector.java
+@@ -53,6 +53,7 @@ import com.android.server.ranging.blerssi.BleRssiConfigSelector;
+ import com.android.server.ranging.common.NoOpRangingAdapter;
+ import com.android.server.ranging.cs.CsAdapter;
+ import com.android.server.ranging.cs.CsCapabilitiesAdapter;
++import com.android.server.ranging.cs.CsConfig;
+ import com.android.server.ranging.cs.CsConfigSelector;
+ import com.android.server.ranging.oob.OobController;
+ import com.android.server.ranging.oob.packets.DeviceType;
+@@ -198,7 +199,8 @@ public class RangingInjector {
+         return switch (config.getTechnology()) {
+             case UWB -> new UwbAdapter(
+                     mContext, this, attributionSource, executor, lock, config.getDeviceRole());
+-            case CS -> config.getDeviceRole() == RangingPreference.DEVICE_ROLE_INITIATOR
++            case CS -> (config.getDeviceRole() == RangingPreference.DEVICE_ROLE_INITIATOR
++                    || config instanceof CsConfig)
+                     ? new CsAdapter(mContext, this, lock)
+                     : new NoOpRangingAdapter(RangingTechnology.CS, lock);
+             case RTT, RTT_STATION -> new RttAdapter(
+diff --git a/ranging/service/java/com/android/server/ranging/common/ConfigurationUtils.java b/ranging/service/java/com/android/server/ranging/common/ConfigurationUtils.java
+index ceee859..ea80ac1 100644
+--- a/ranging/service/java/com/android/server/ranging/common/ConfigurationUtils.java
++++ b/ranging/service/java/com/android/server/ranging/common/ConfigurationUtils.java
+@@ -148,9 +148,14 @@ public class ConfigurationUtils {
+                 if (role == DEVICE_ROLE_INITIATOR) {
+                     configs.add(new CsConfig(
+                             peer.getCsRangingParams(), sessionConfig, peer.getRangingDevice(),
+-                            null));
++                            null, DEVICE_ROLE_INITIATOR));
++                } else if (Flags.rangingCsEphemeralLtk()
++                        && peer.getCsRangingParams().getEphemeralLtk() != null) {
++                    configs.add(new CsConfig(
++                            peer.getCsRangingParams(), sessionConfig, peer.getRangingDevice(),
++                            null, DEVICE_ROLE_RESPONDER));
+                 } else {
+-                    // BLE CS responder does not need configuration parameters.
++                    // BLE CS responder does not need configuration parameters when already bonded.
+                     configs.add(new EmptyTechnologyConfig(
+                             RangingTechnology.CS, DEVICE_ROLE_RESPONDER,
+                             ImmutableSet.of(peer.getRangingDevice())));
+diff --git a/ranging/service/java/com/android/server/ranging/cs/CsAdapter.java b/ranging/service/java/com/android/server/ranging/cs/CsAdapter.java
+index 02d4cae..40dccf4 100644
+--- a/ranging/service/java/com/android/server/ranging/cs/CsAdapter.java
++++ b/ranging/service/java/com/android/server/ranging/cs/CsAdapter.java
+@@ -213,7 +213,9 @@ public class CsAdapter implements RangingAdapter {
+     @Override
+     public void stop() {
+         Log.i(TAG, "Stop called for CsAdapter : " + mId);
+-        CsSession.deregisterAdapter(this, mPeerPseudoBluetoothDevice.getAddress());
++        if (mPeerPseudoBluetoothDevice != null) {
++            CsSession.deregisterAdapter(this, mPeerPseudoBluetoothDevice.getAddress());
++        }
+         closeForReason(InternalReason.LOCAL_REQUEST);
+     }
+ 
+diff --git a/ranging/service/java/com/android/server/ranging/cs/CsConfig.java b/ranging/service/java/com/android/server/ranging/cs/CsConfig.java
+index 0ac339c..4416e5a 100644
+--- a/ranging/service/java/com/android/server/ranging/cs/CsConfig.java
++++ b/ranging/service/java/com/android/server/ranging/cs/CsConfig.java
+@@ -58,16 +58,29 @@ public class CsConfig implements TechnologyConfig {
+     private final BleCsRangingParams mRangingParams;
+     private final RangingDevice mPeerDevice;
+     private final BluetoothDevice mPeerBluetoothDevice;
++    @RangingPreference.DeviceRole
++    private final int mDeviceRole;
+ 
+     public CsConfig(
+             BleCsRangingParams bleCsRangingParams,
+             SessionConfig sessionConfig,
+             @NonNull RangingDevice peerDevice,
+             @Nullable BluetoothDevice peerBluetoothDevice) {
++        this(bleCsRangingParams, sessionConfig, peerDevice, peerBluetoothDevice,
++                DEVICE_ROLE_INITIATOR);
++    }
++
++    public CsConfig(
++            BleCsRangingParams bleCsRangingParams,
++            SessionConfig sessionConfig,
++            @NonNull RangingDevice peerDevice,
++            @Nullable BluetoothDevice peerBluetoothDevice,
++            @RangingPreference.DeviceRole int deviceRole) {
+         mRangingParams = bleCsRangingParams;
+         mSessionConfig = sessionConfig;
+         mPeerDevice = peerDevice;
+         mPeerBluetoothDevice = peerBluetoothDevice;
++        mDeviceRole = deviceRole;
+     }
+ 
+     @Override
+@@ -95,7 +108,7 @@ public class CsConfig implements TechnologyConfig {
+ 
+     @Override
+     public @RangingPreference.DeviceRole int getDeviceRole() {
+-        return DEVICE_ROLE_INITIATOR;
++        return mDeviceRole;
+     }
+ 
+     @Override
+@@ -118,6 +131,8 @@ public class CsConfig implements TechnologyConfig {
+                 + mPeerDevice
+                 + ", mPeerBluetoothDevice="
+                 + mPeerBluetoothDevice
++                + ", mDeviceRole="
++                + mDeviceRole
+                 + " }";
+     }
+ 
+@@ -125,13 +140,14 @@ public class CsConfig implements TechnologyConfig {
+     public boolean equals(Object o) {
+         if (this == o) return true;
+         if (!(o instanceof CsConfig csConfig)) return false;
+-        return Objects.equals(mSessionConfig, csConfig.mSessionConfig)
++        return mDeviceRole == csConfig.mDeviceRole
++                && Objects.equals(mSessionConfig, csConfig.mSessionConfig)
+                 && Objects.equals(mRangingParams, csConfig.mRangingParams)
+                 && Objects.equals(mPeerDevice, csConfig.mPeerDevice);
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return Objects.hash(mSessionConfig, mRangingParams, mPeerDevice);
++        return Objects.hash(mSessionConfig, mRangingParams, mPeerDevice, mDeviceRole);
+     }
+ }
+diff --git a/ranging/service/java/com/android/server/ranging/cs/CsSession.java b/ranging/service/java/com/android/server/ranging/cs/CsSession.java
+index 4736b79..6d24f42 100644
+--- a/ranging/service/java/com/android/server/ranging/cs/CsSession.java
++++ b/ranging/service/java/com/android/server/ranging/cs/CsSession.java
+@@ -37,6 +37,7 @@ import android.os.CancellationSignal;
+ import android.ranging.RangingData;
+ import android.ranging.RangingDataExtras;
+ import android.ranging.RangingMeasurement;
++import android.ranging.RangingPreference;
+ import android.ranging.ble.BleSpecificData;
+ import android.ranging.ble.cs.BleCsConstants;
+ import android.ranging.ble.cs.BleCsRangingParams;
+@@ -70,6 +71,10 @@ class CsSession {
+     private DistanceMeasurementSession mSession;
+     private CsConfig mConfig;
+ 
++    private static String getSessionKey(String peerPseudoAddress, int deviceRole) {
++        return peerPseudoAddress + ":" + deviceRole;
++    }
++
+     static void registerAdapter(
+             CsAdapter adapter,
+             BluetoothAdapter bluetoothAdapter,
+@@ -80,8 +85,9 @@ class CsSession {
+         Log.i(TAG, "Registering adapter: " + adapter.getId());
+ 
+         synchronized (sCsSessions) {
+-            String peerPseudoAddress = bluetoothDevice.getAddress();
+-            CsSession currentSession = sCsSessions.get(peerPseudoAddress);
++            String sessionKey =
++                    getSessionKey(bluetoothDevice.getAddress(), csConfig.getDeviceRole());
++            CsSession currentSession = sCsSessions.get(sessionKey);
+ 
+             if (currentSession != null) {
+                 Log.i(TAG,
+@@ -100,7 +106,7 @@ class CsSession {
+                     csConfig,
+                     lock);
+             currentSession.mCsAdapters.add(adapter);
+-            sCsSessions.put(peerPseudoAddress, currentSession);
++            sCsSessions.put(sessionKey, currentSession);
+             currentSession.start();
+         }
+     }
+@@ -109,7 +115,11 @@ class CsSession {
+         Log.i(TAG, "Deregistering adapter: " + adapter.getId());
+ 
+         synchronized (sCsSessions) {
+-            CsSession sessionToStop = sCsSessions.get(peerPseudoAddress);
++            int deviceRole =
++                    adapter.mConfig != null
++                            ? adapter.mConfig.getDeviceRole()
++                            : RangingPreference.DEVICE_ROLE_INITIATOR;
++            CsSession sessionToStop = sCsSessions.get(getSessionKey(peerPseudoAddress, deviceRole));
+ 
+             if (sessionToStop == null
+                     || (sessionToStop.mStartCancellationSignal == null
+@@ -158,13 +168,24 @@ class CsSession {
+         int frequency = getFrequency(bleCsRangingParams.getRangingUpdateRate());
+         int methodId = DistanceMeasurementMethod.DISTANCE_MEASUREMENT_METHOD_CHANNEL_SOUNDING;
+ 
++        ChannelSoundingParams.Builder csParamsBuilder =
++                new ChannelSoundingParams.Builder()
++                        .setLocationType(bleCsRangingParams.getLocationType())
++                        .setCsSecurityLevel(bleCsRangingParams.getSecurityLevel())
++                        .setSightType(bleCsRangingParams.getSightType());
++        if (com.android.ranging.flags.Flags.rangingCsEphemeralLtk()
++                && com.android.bluetooth.flags.Flags.channelSoundingEphemeralLtk()) {
++            if (bleCsRangingParams.getEphemeralLtk() != null) {
++                csParamsBuilder.setEphemeralLtk(bleCsRangingParams.getEphemeralLtk());
++            }
++            if (mConfig.getDeviceRole() == RangingPreference.DEVICE_ROLE_RESPONDER) {
++                csParamsBuilder.setResponderOnly(true);
++            }
++        }
++
+         DistanceMeasurementParams params =
+                 new DistanceMeasurementParams.Builder(mPeerBluetoothDevice)
+-                        .setChannelSoundingParams(new ChannelSoundingParams.Builder()
+-                                .setLocationType(bleCsRangingParams.getLocationType())
+-                                .setCsSecurityLevel(bleCsRangingParams.getSecurityLevel())
+-                                .setSightType(bleCsRangingParams.getSightType())
+-                                .build())
++                        .setChannelSoundingParams(csParamsBuilder.build())
+                         .setDurationSeconds(duration)
+                         .setFrequency(frequency)
+                         .setMethodId(methodId)
+@@ -195,7 +216,11 @@ class CsSession {
+                 mSession.stopSession();
+             }
+ 
+-            sCsSessions.remove(mPeerBluetoothDevice.getAddress());
++            int deviceRole =
++                    mConfig != null
++                            ? mConfig.getDeviceRole()
++                            : RangingPreference.DEVICE_ROLE_INITIATOR;
++            sCsSessions.remove(getSessionKey(mPeerBluetoothDevice.getAddress(), deviceRole));
+ 
+             if (mConfig != null && mConfig.getSessionConfig().getRangingMeasurementsLimit() > 0) {
+                 cancelMeasurementsLimit();

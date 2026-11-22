@@ -58,6 +58,7 @@ class SessionEncryption(
     private var sessionEstablishmentSent = false
     private lateinit var skRemote: SecretKey
     private lateinit var skSelf: SecretKey
+    private lateinit var bleLtk: SecretKey
     private var nextSequenceNumber_ = 0
     private var decryptedCounter = 1
     private var encryptedCounter = 1
@@ -71,6 +72,9 @@ class SessionEncryption(
         }
         if (::skRemote.isInitialized) {
             skRemote.close()
+        }
+        if (::bleLtk.isInitialized) {
+            bleLtk.close()
         }
         eSelfKey.close()
     }
@@ -104,6 +108,8 @@ class SessionEncryption(
             deviceSK = Hkdf.deriveKey(Algorithm.HMAC_SHA256, sharedSecret, salt, info, 32)
             info = "SKReader".encodeToByteArray()
             readerSK = Hkdf.deriveKey(Algorithm.HMAC_SHA256, sharedSecret, salt, info, 32)
+            info = "BLELTK".encodeToByteArray()
+            bleLtk = Hkdf.deriveKey(Algorithm.HMAC_SHA256, sharedSecret, salt, info, 16)
         } finally {
             sharedSecret.close()
         }
@@ -114,6 +120,21 @@ class SessionEncryption(
             skSelf = readerSK
             skRemote = deviceSK
         }
+    }
+
+    /**
+     * Derives and returns a fresh [SecretKey] copy of the 16-byte ephemeral Bluetooth LE Long Term
+     * Key (`BLELTK`) for this session using HKDF-SHA-256 over the ECKA-DH shared secret with
+     * `SHA-256(SessionTranscriptBytes)` as salt and `"BLELTK"` as info.
+     *
+     * Callers should [SecretKey.close] (or use [use]) the returned key once finished with it.
+     *
+     * @return the 16-byte `BLELTK` [SecretKey] for encrypting an unbonded BLE connection prior to
+     *   Channel Sounding.
+     */
+    suspend fun getBleLtk(): SecretKey {
+        ensureInitialized()
+        return SecretKey(bleLtk)
     }
 
     /**

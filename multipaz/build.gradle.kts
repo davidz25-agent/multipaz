@@ -7,6 +7,7 @@ import org.gradle.kotlin.dsl.get
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.jetbrains.kotlin.konan.target.HostManager
 
 plugins {
@@ -182,6 +183,7 @@ kotlin {
         val androidMain by getting {
             dependsOn(javaSharedMain)
             dependencies {
+                compileOnly(files("$rootDir/android-cs-patches/framework-ranging.stubs.jar"))
                 implementation(libs.androidx.biometrics)
                 implementation(libs.androidx.lifecycle.viewmodel)
             }
@@ -267,6 +269,18 @@ kotlin {
 dependencies {
     add("kspCommonMainMetadata", project(":multipaz-cbor-rpc"))
     add("kspJvmTest", project(":multipaz-cbor-rpc"))
+}
+
+// Ensure the patched framework-ranging compileOnly stub JAR precedes SDK 36's android.jar on
+// Android Kotlin compilation classpaths so BleCsRangingParams.Builder.setEphemeralLtk() resolves.
+val patchedRangingStubsJar = files("$rootDir/android-cs-patches/framework-ranging.stubs.jar")
+afterEvaluate {
+    tasks.withType<KotlinJvmCompile>().configureEach {
+        if (name.contains("Android")) {
+            val existing = ArrayList(libraries.from)
+            libraries.setFrom(patchedRangingStubsJar, existing)
+        }
+    }
 }
 
 tasks.all {

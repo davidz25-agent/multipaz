@@ -26,6 +26,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.io.bytestring.ByteString
 import org.multipaz.context.applicationContext
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BleAddressType
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.util.Logger
@@ -83,6 +84,9 @@ internal class BleCentralHalAndroid : BleCentralHal {
     private val characteristicsByUuid = mutableMapOf<UUID, BluetoothGattCharacteristic>()
     private var l2capSocket: BluetoothSocket? = null
     private var l2capConnectJob: Job? = null
+
+    private val peerBluetoothAddress: String?
+        get() = l2capSocket?.remoteDevice?.address ?: device?.address
 
     init {
         if (bluetoothManager.adapter == null) {
@@ -545,6 +549,26 @@ internal class BleCentralHalAndroid : BleCentralHal {
         l2capConnectJob?.cancel()
         l2capConnectJob = null
         l2capSocket = null
+    }
+
+    override suspend fun isChannelSoundingAvailable(): Boolean =
+        isAndroidBluetoothChannelSoundingAvailable()
+
+    override suspend fun startChannelSounding(
+        asInitiator: Boolean,
+        ephemeralLtk: SecretKey?,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        val address = peerBluetoothAddress ?: run {
+            Logger.w(TAG, "Cannot start Channel Sounding: peer Bluetooth address is unknown")
+            return
+        }
+        runAndroidBluetoothChannelSounding(
+            peerBluetoothAddress = address,
+            asInitiator = asInitiator,
+            ephemeralLtk = ephemeralLtk,
+            onResult = onResult,
+        )
     }
 
     override fun close() {

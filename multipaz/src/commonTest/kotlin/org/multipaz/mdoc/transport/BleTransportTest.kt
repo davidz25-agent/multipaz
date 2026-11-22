@@ -1,12 +1,18 @@
 package org.multipaz.mdoc.transport
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.io.bytestring.ByteString
 import kotlinx.io.bytestring.ByteStringBuilder
@@ -18,6 +24,7 @@ import org.multipaz.crypto.Crypto
 import org.multipaz.crypto.EcCurve
 import org.multipaz.crypto.EcPublicKey
 import org.multipaz.crypto.EcPublicKeyDoubleCoordinate
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BleAddressType
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
@@ -37,6 +44,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Unit tests for the four ISO 18013-5 BLE transport implementations:
@@ -1228,6 +1236,69 @@ class BleTransportTest {
         fallbackCentral.close()
     }
 
+    @Test
+    fun channelSoundingAvailablePropagatedThroughTransportsAndCoalescing() = runTest {
+        val mdocMethods = listOf(
+            MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                uuid = testUuid,
+                bleChannelSoundingAvailable = true,
+            ),
+            MdocConnectionMethod.Ble.GattPeripheral(
+                uuid = testUuid,
+                bleChannelSoundingAvailable = true,
+            ),
+        )
+        val mdocTransports = createMdocTransportsFromManagers(
+            connectionMethods = mdocMethods,
+            role = MdocRole.MDOC,
+            options = MdocTransportOptions(),
+            centralManagerFactory = { FakeBleCentralManager(expectedIdent = senderIdent) },
+            peripheralManagerFactory = {
+                FakeBlePeripheralManager(publishedL2capPsm = 130)
+            },
+            nonBleTransportFactory = { error("Unexpected $it") },
+        )
+        assertEquals(1, mdocTransports.size)
+        val mdocPeripheral = mdocTransports.single()
+        mdocPeripheral.advertise()
+        assertEquals(
+            listOf(
+                MdocConnectionMethod.Ble.DirectL2capPeripheral(
+                    uuid = testUuid,
+                    psm = 130,
+                    bleChannelSoundingAvailable = true,
+                ),
+                MdocConnectionMethod.Ble.GattPeripheral(
+                    uuid = testUuid,
+                    bleChannelSoundingAvailable = true,
+                ),
+            ),
+            mdocPeripheral.connectionMethods
+        )
+        mdocPeripheral.open(senderKey)
+        assertEquals(MdocTransport.State.CONNECTED, mdocPeripheral.state.value)
+        mdocPeripheral.close()
+
+        val readerTransports = createMdocTransportsFromManagers(
+            connectionMethods = mdocPeripheral.connectionMethods,
+            role = MdocRole.MDOC_READER,
+            options = MdocTransportOptions(),
+            centralManagerFactory = {
+                FakeBleCentralManager(expectedIdent = senderIdent)
+            },
+            peripheralManagerFactory = { FakeBlePeripheralManager() },
+            nonBleTransportFactory = { error("Unexpected $it") },
+        )
+        assertEquals(2, readerTransports.size)
+        for (transport in readerTransports) {
+            val cm = assertIs<MdocConnectionMethod.Ble>(transport.connectionMethod)
+            assertTrue(cm.bleChannelSoundingAvailable)
+            transport.open(senderKey)
+            assertEquals(MdocTransport.State.CONNECTED, transport.state.value)
+            transport.close()
+        }
+    }
+
     /**
      * Wraps a real [BlePeripheralManagerImpl] with a [FakeBlePeripheralHal] so tests can exercise the
      * full [BlePeripheralManagerImpl] state machine while inspecting recorded HAL calls and injecting
@@ -1273,6 +1344,9 @@ class BleTransportTest {
         val startL2capServerValue: Boolean get() = hal.publishL2capCalled
         val stateCharacteristicWrites: List<Int> get() = hal.stateCharacteristicWrites
         val sentMessages: List<ByteArray> get() = hal.sentMessages
+        val channelSoundingCalls: List<Pair<Boolean, ByteArray?>> get() = hal.channelSoundingCalls
+        val channelSoundingStarted: CompletableDeferred<Unit> get() = hal.channelSoundingStarted
+        val channelSoundingCancelled: CompletableDeferred<Unit> get() = hal.channelSoundingCancelled
 
         /** Simulates the remote BLE central unexpectedly disconnecting from our GATT server. */
         fun simulateCentralDisconnected() {
@@ -1328,6 +1402,9 @@ class BleTransportTest {
         var lastReadResponse: ByteArray? = null
         val stateCharacteristicWrites = mutableListOf<Int>()
         val sentMessages = mutableListOf<ByteArray>()
+        val channelSoundingCalls = mutableListOf<Pair<Boolean, ByteArray?>>()
+        val channelSoundingStarted = CompletableDeferred<Unit>()
+        val channelSoundingCancelled = CompletableDeferred<Unit>()
         private var outgoingGattBuffer = ByteStringBuilder()
 
         override fun setCallback(callback: BlePeripheralHal.Callback) {
@@ -1407,6 +1484,26 @@ class BleTransportTest {
             halCallback.onNotificationSent(uuid, null)
         }
 
+        override suspend fun startChannelSounding(
+            asInitiator: Boolean,
+            ephemeralLtk: SecretKey?,
+            onResult: (BleChannelSoundingResult) -> Unit,
+        ) {
+            channelSoundingCalls.add(asInitiator to ephemeralLtk?.toByteArray())
+            onResult(
+                BleChannelSoundingResult(
+                    distanceMeters = 1.25,
+                    confidence = BleChannelSoundingConfidence.HIGH,
+                )
+            )
+            channelSoundingStarted.complete(Unit)
+            try {
+                awaitCancellation()
+            } finally {
+                channelSoundingCancelled.complete(Unit)
+            }
+        }
+
         override fun close() {
             closeCalls += 1
         }
@@ -1457,11 +1554,14 @@ class BleTransportTest {
         val discoverServicesCalls: Int get() = hal.discoverServicesCalls
         val discoverCharacteristicsCalls: Int get() = hal.discoverCharacteristicsCalls
         val checkReaderIdentCalls: Int get() = hal.checkReaderIdentCalls
-        val subscribeToCharacteristicsCalls: Int get() = hal.enableNotificationsCalls / 2
+        val subscribeToCharacteristicsCalls: Int get() = hal.subscribeToCharacteristicsCalls
         val l2capUuidValue: UUID? get() = hal.l2capCharacteristicUuid
         val stateCharacteristicWrites: List<Int> get() = hal.stateCharacteristicWrites
         val sentMessages: List<ByteArray> get() = hal.sentMessages
         val connectedL2capPsms: List<Int> get() = hal.connectedL2capPsms
+        val channelSoundingCalls: List<Pair<Boolean, ByteArray?>> get() = hal.channelSoundingCalls
+        val channelSoundingStarted: CompletableDeferred<Unit> get() = hal.channelSoundingStarted
+        val channelSoundingCancelled: CompletableDeferred<Unit> get() = hal.channelSoundingCancelled
 
         /** Simulates the remote BLE peripheral unexpectedly disconnecting from our GATT client. */
         fun simulateDisconnected() {
@@ -1502,6 +1602,7 @@ class BleTransportTest {
         var discoverCharacteristicsCalls = 0
         var checkReaderIdentCalls = 0
         var enableNotificationsCalls = 0
+        val subscribeToCharacteristicsCalls: Int get() = enableNotificationsCalls / 2
         var stateCharacteristicUuid: UUID? = null
         var client2ServerCharacteristicUuid: UUID? = null
         var server2ClientCharacteristicUuid: UUID? = null
@@ -1510,6 +1611,9 @@ class BleTransportTest {
         val stateCharacteristicWrites = mutableListOf<Int>()
         val sentMessages = mutableListOf<ByteArray>()
         val connectedL2capPsms = mutableListOf<Int>()
+        val channelSoundingCalls = mutableListOf<Pair<Boolean, ByteArray?>>()
+        val channelSoundingStarted = CompletableDeferred<Unit>()
+        val channelSoundingCancelled = CompletableDeferred<Unit>()
         private var outgoingGattBuffer = ByteStringBuilder()
 
         override fun setCallback(callback: BleCentralHal.Callback) {
@@ -1617,6 +1721,26 @@ class BleTransportTest {
 
         override fun closeConnectedL2capAttempt() {}
 
+        override suspend fun startChannelSounding(
+            asInitiator: Boolean,
+            ephemeralLtk: SecretKey?,
+            onResult: (BleChannelSoundingResult) -> Unit,
+        ) {
+            channelSoundingCalls.add(asInitiator to ephemeralLtk?.toByteArray())
+            onResult(
+                BleChannelSoundingResult(
+                    distanceMeters = 1.25,
+                    confidence = BleChannelSoundingConfidence.HIGH,
+                )
+            )
+            channelSoundingStarted.complete(Unit)
+            try {
+                awaitCancellation()
+            } finally {
+                channelSoundingCancelled.complete(Unit)
+            }
+        }
+
         override fun close() {
             isConnected = false
             closeCalls += 1
@@ -1645,5 +1769,243 @@ class BleTransportTest {
         override fun close() {
             incoming.close()
         }
+    }
+
+    /**
+     * Verifies that all four BLE transports delegate [MdocTransport.startBleChannelSounding] to
+     * their underlying [BleCentralHal] / [BlePeripheralHal] with the expected initiator/responder
+     * role, `BLELTK` (even if the caller immediately closes its [SecretKey]), and range result
+     * callback, ignore duplicate calls with the same active key, cancel the HAL Channel Sounding
+     * session on [MdocTransport.close], and skip Channel Sounding when `bleChannelSoundingAvailable`
+     * is `false`.
+     */
+    @Test
+    fun bleTransportsDelegateChannelSoundingToHal() = runTest {
+        assertFalse(MdocTransportFactory.Default.isBleChannelSoundingAvailable())
+        assertFalse(FakeBleCentralHal().isChannelSoundingAvailable())
+        assertFalse(FakeBlePeripheralHal().isChannelSoundingAvailable())
+
+        val ltkBytes = ByteArray(16) { (it + 0x41).toByte() }
+        val expectedResult = BleChannelSoundingResult(
+            distanceMeters = 1.25,
+            confidence = BleChannelSoundingConfidence.HIGH,
+        )
+
+        // 1. BleTransportCentralMdoc (MDOC -> responder: asInitiator = false)
+        val centralMdocMgr = FakeBleCentralManager(expectedIdent = senderIdent)
+        val centralMdoc = BleTransportCentralMdoc(
+            role = MdocRole.MDOC,
+            options = MdocTransportOptions(bleUseL2CAP = false),
+            centralManager = centralMdocMgr,
+            uuid = testUuid,
+            psm = null,
+            bleChannelSoundingAvailable = true,
+        )
+        centralMdoc.open(senderKey)
+        val centralMdocResult = CompletableDeferred<BleChannelSoundingResult>()
+        SecretKey(ltkBytes).use { ltk ->
+            centralMdoc.startBleChannelSounding(ltk) { centralMdocResult.complete(it) }
+        }
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                centralMdocMgr.channelSoundingStarted.await()
+                assertEquals(expectedResult, centralMdocResult.await())
+            }
+        }
+        assertEquals(1, centralMdocMgr.channelSoundingCalls.size)
+        assertFalse(centralMdocMgr.channelSoundingCalls[0].first)
+        assertContentEquals(ltkBytes, centralMdocMgr.channelSoundingCalls[0].second)
+        // Duplicate call with identical key while active does not relaunch:
+        SecretKey(ltkBytes).use { ltk ->
+            centralMdoc.startBleChannelSounding(ltk)
+        }
+        centralMdoc.close()
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                centralMdocMgr.channelSoundingCancelled.await()
+            }
+        }
+        assertEquals(1, centralMdocMgr.channelSoundingCalls.size)
+
+        // 2. BleTransportPeripheralMdocReader (MDOC_READER -> initiator: asInitiator = true)
+        val peripheralReaderMgr = FakeBleCentralManager()
+        val peripheralReader = BleTransportPeripheralMdocReader(
+            role = MdocRole.MDOC_READER,
+            options = MdocTransportOptions(bleUseL2CAP = false),
+            centralManager = peripheralReaderMgr,
+            uuid = testUuid,
+            psm = null,
+            bleChannelSoundingAvailable = true,
+        )
+        peripheralReader.open(senderKey)
+        val peripheralReaderResult = CompletableDeferred<BleChannelSoundingResult>()
+        SecretKey(ltkBytes).use { ltk ->
+            peripheralReader.startBleChannelSounding(ltk) { peripheralReaderResult.complete(it) }
+        }
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                peripheralReaderMgr.channelSoundingStarted.await()
+                assertEquals(expectedResult, peripheralReaderResult.await())
+            }
+        }
+        assertEquals(1, peripheralReaderMgr.channelSoundingCalls.size)
+        assertTrue(peripheralReaderMgr.channelSoundingCalls[0].first)
+        assertContentEquals(ltkBytes, peripheralReaderMgr.channelSoundingCalls[0].second)
+        peripheralReader.close()
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                peripheralReaderMgr.channelSoundingCancelled.await()
+            }
+        }
+
+        // 3. BleTransportPeripheralMdoc (MDOC -> responder: asInitiator = false)
+        val peripheralMdocMgr = FakeBlePeripheralManager()
+        val peripheralMdoc = BleTransportPeripheralMdoc(
+            role = MdocRole.MDOC,
+            options = MdocTransportOptions(bleUseL2CAP = false),
+            peripheralManager = peripheralMdocMgr,
+            uuid = testUuid,
+            gattEnabled = true,
+            directL2capEnabled = false,
+            bleChannelSoundingAvailable = true,
+        )
+        peripheralMdoc.open(senderKey)
+        val peripheralMdocResult = CompletableDeferred<BleChannelSoundingResult>()
+        SecretKey(ltkBytes).use { ltk ->
+            peripheralMdoc.startBleChannelSounding(ltk) { peripheralMdocResult.complete(it) }
+        }
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                peripheralMdocMgr.channelSoundingStarted.await()
+                assertEquals(expectedResult, peripheralMdocResult.await())
+            }
+        }
+        assertEquals(1, peripheralMdocMgr.channelSoundingCalls.size)
+        assertFalse(peripheralMdocMgr.channelSoundingCalls[0].first)
+        assertContentEquals(ltkBytes, peripheralMdocMgr.channelSoundingCalls[0].second)
+        peripheralMdoc.close()
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                peripheralMdocMgr.channelSoundingCancelled.await()
+            }
+        }
+
+        // 4. BleTransportCentralMdocReader (MDOC_READER -> initiator: asInitiator = true)
+        val centralReaderMgr = FakeBlePeripheralManager()
+        val centralReader = BleTransportCentralMdocReader(
+            role = MdocRole.MDOC_READER,
+            options = MdocTransportOptions(bleUseL2CAP = false),
+            peripheralManager = centralReaderMgr,
+            uuid = testUuid,
+            gattEnabled = true,
+            directL2capEnabled = false,
+            bleChannelSoundingAvailable = true,
+        )
+        centralReader.open(senderKey)
+        val centralReaderResult = CompletableDeferred<BleChannelSoundingResult>()
+        SecretKey(ltkBytes).use { ltk ->
+            centralReader.startBleChannelSounding(ltk) { centralReaderResult.complete(it) }
+        }
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                centralReaderMgr.channelSoundingStarted.await()
+                assertEquals(expectedResult, centralReaderResult.await())
+            }
+        }
+        assertEquals(1, centralReaderMgr.channelSoundingCalls.size)
+        assertTrue(centralReaderMgr.channelSoundingCalls[0].first)
+        assertContentEquals(ltkBytes, centralReaderMgr.channelSoundingCalls[0].second)
+        centralReader.close()
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                centralReaderMgr.channelSoundingCancelled.await()
+            }
+        }
+
+        // 5. bleChannelSoundingAvailable = false -> HAL is not invoked
+        val disabledMgr = FakeBleCentralManager(expectedIdent = senderIdent)
+        val disabledTransport = BleTransportCentralMdoc(
+            role = MdocRole.MDOC,
+            options = MdocTransportOptions(bleUseL2CAP = false),
+            centralManager = disabledMgr,
+            uuid = testUuid,
+            psm = null,
+            bleChannelSoundingAvailable = false,
+        )
+        disabledTransport.open(senderKey)
+        SecretKey(ltkBytes).use { ltk ->
+            disabledTransport.startBleChannelSounding(ltk)
+        }
+        disabledTransport.close()
+        assertTrue(disabledMgr.channelSoundingCalls.isEmpty())
+    }
+
+    /**
+     * Verifies that [NfcCceTransportMdoc.startBleChannelSounding] forwards the session `BLELTK`
+     * and range callback to a secondary transport both when called before
+     * [NfcCceTransportMdoc.setTransport] and when called after [NfcCceTransportMdoc.setTransport].
+     */
+    @Test
+    fun nfcCceTransportForwardsStartBleChannelSoundingToSecondaryTransport() = runTest {
+        val forwardedLtks = mutableListOf<ByteString>()
+        val receivedResults = mutableListOf<BleChannelSoundingResult>()
+        val secondaryTransport = object : MdocTransport() {
+            private val _state = MutableStateFlow(State.CONNECTED)
+            override val state: StateFlow<State> = _state
+            override val role: MdocRole = MdocRole.MDOC
+            override val connectionMethod: MdocConnectionMethod? = null
+            override val scanningTime = null
+            override suspend fun advertise() {}
+            override suspend fun open(eSenderKeyBytes: ByteString) {}
+            override suspend fun sendMessage(message: ByteArray) {}
+            override suspend fun waitForMessage(): ByteArray {
+                CompletableDeferred<Unit>().await()
+                return byteArrayOf()
+            }
+            override suspend fun close() {
+                _state.value = State.CLOSED
+            }
+            override fun startBleChannelSounding(
+                bleLtk: SecretKey,
+                onResult: (BleChannelSoundingResult) -> Unit,
+            ) {
+                forwardedLtks.add(ByteString(bleLtk.toByteArray()))
+                onResult(
+                    BleChannelSoundingResult(
+                        distanceMeters = forwardedLtks.size.toDouble(),
+                        confidence = BleChannelSoundingConfidence.MEDIUM,
+                    )
+                )
+            }
+        }
+
+        val ltk1Bytes = ByteArray(16) { (it + 1).toByte() }
+        val ltk2Bytes = ByteArray(16) { (it + 0x20).toByte() }
+        val ltk1Expected = ByteString(ltk1Bytes)
+        val ltk2Expected = ByteString(ltk2Bytes)
+        val cceTransport = NfcCceTransportMdoc(sendMessageViaNfc = { true })
+        cceTransport.open(senderKey)
+
+        // Called before secondary BLE transport finishes connecting (and caller closes its key):
+        SecretKey(ltk1Bytes).use { ltk1 ->
+            cceTransport.startBleChannelSounding(ltk1) { receivedResults.add(it) }
+        }
+        assertTrue(forwardedLtks.isEmpty())
+        assertTrue(receivedResults.isEmpty())
+
+        cceTransport.setTransport(secondaryTransport)
+        assertEquals(listOf(ltk1Expected), forwardedLtks)
+        assertEquals(1, receivedResults.size)
+        assertEquals(1.0, receivedResults[0].distanceMeters)
+
+        // Called after secondary BLE transport is already attached:
+        SecretKey(ltk2Bytes).use { ltk2 ->
+            cceTransport.startBleChannelSounding(ltk2) { receivedResults.add(it) }
+        }
+        assertEquals(listOf(ltk1Expected, ltk2Expected), forwardedLtks)
+        assertEquals(2, receivedResults.size)
+        assertEquals(2.0, receivedResults[1].distanceMeters)
+
+        cceTransport.close()
     }
 }

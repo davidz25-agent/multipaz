@@ -232,6 +232,10 @@ actual object TestAppConfiguration {
         ): List<MdocTransport> = AndroidUsbBluetoothManager
             .getActiveTransportFactory()
             .createTransports(connectionMethods, role, options)
+
+        override suspend fun isBleChannelSoundingAvailable(): Boolean = AndroidUsbBluetoothManager
+            .getActiveTransportFactory()
+            .isBleChannelSoundingAvailable()
     }
 
     actual val isUsingExternalBleAdapter: StateFlow<Boolean>

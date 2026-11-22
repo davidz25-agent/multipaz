@@ -231,6 +231,15 @@ private class Iso18013PresentmentSession(
         if (status == Constants.SESSION_DATA_STATUS_SESSION_TERMINATION || encodedRetapRequest == null) {
             throw IllegalStateException("No DeviceRequest in message from reader on NFC re-tap")
         }
+        newSessionEncryption.getBleLtk().use { bleLtk ->
+            transport.startBleChannelSounding(bleLtk) { result ->
+                Logger.i(
+                    TAG,
+                    "BLE Channel Sounding distance: ${result.distanceMeters} m " +
+                        "(confidence: ${result.confidence})"
+                )
+            }
+        }
         lastRequestSizeBytes = encodedRetapRequest.size
         val retapDeviceRequest = DeviceRequest.fromDataItem(Cbor.decode(encodedRetapRequest))
         lastDeviceRequest = retapDeviceRequest
@@ -394,6 +403,16 @@ private class Iso18013PresentmentSession(
                     Logger.i(TAG, "Received session termination message from reader")
                     sendSessionTermination = false
                     break
+                }
+
+                sessionEncryption!!.getBleLtk().use { bleLtk ->
+                    transport.startBleChannelSounding(bleLtk) { result ->
+                        Logger.i(
+                            TAG,
+                            "BLE Channel Sounding distance: ${result.distanceMeters} m " +
+                                "(confidence: ${result.confidence})"
+                        )
+                    }
                 }
 
                 if (encodedDeviceRequest == null) {

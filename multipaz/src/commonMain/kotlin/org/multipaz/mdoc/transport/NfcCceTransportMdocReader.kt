@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.io.bytestring.ByteString
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.nfc.nfcCceTransact
 import org.multipaz.mdoc.role.MdocRole
@@ -178,6 +179,10 @@ class NfcCceTransportMdocReader(
     private var negotiatedTransportOpenJob: Job? = null
     private var negotiatedTransportReady = false
     private val negotiatedTransportPendingOutgoingMessages = mutableListOf<ByteString>()
+    @Volatile
+    private var pendingBleLtk: SecretKey? = null
+    @Volatile
+    private var pendingBleLtkCallback: (BleChannelSoundingResult) -> Unit = {}
 
     private suspend fun conveyMessage(message: ByteString, fromNfc: Boolean) {
         val info = parseCceSessionMessageInfo(message)
@@ -298,6 +303,12 @@ class NfcCceTransportMdocReader(
                                 "Sending message over Transport of length ${message.size} (backlog index $idx)"
                             )
                             numSentViaTransport += 1
+                        }
+                    }
+
+                    pendingBleLtk?.let { ltk ->
+                        if (!ltk.isDestroyed) {
+                            negotiatedTransport.startBleChannelSounding(ltk, pendingBleLtkCallback)
                         }
                     }
 
@@ -427,6 +438,21 @@ class NfcCceTransportMdocReader(
         }
     }
 
+    override fun startBleChannelSounding(
+        bleLtk: SecretKey,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        bleLtk.checkNotDestroyed()
+        val ltkCopy = SecretKey(bleLtk)
+        val prev = pendingBleLtk
+        pendingBleLtk = ltkCopy
+        pendingBleLtkCallback = onResult
+        prev?.close()
+        if (negotiatedTransportReady && !ltkCopy.isDestroyed) {
+            negotiatedTransport?.startBleChannelSounding(ltkCopy, onResult)
+        }
+    }
+
     override suspend fun close() {
         mutex.withLock {
             if (_state.value == State.CLOSED || _state.value == State.FAILED) {
@@ -451,6 +477,9 @@ class NfcCceTransportMdocReader(
             negotiatedTransportOpenJob?.cancel()
             negotiatedTransportOpenJob = null
             negotiatedTransportReady = false
+            pendingBleLtk?.close()
+            pendingBleLtk = null
+            pendingBleLtkCallback = {}
             negotiatedTransport?.close()
             _state.value = State.CLOSED
         }
@@ -465,6 +494,9 @@ class NfcCceTransportMdocReader(
             return
         }
         Logger.w(TAG, "Failing transport with error", error)
+        pendingBleLtk?.close()
+        pendingBleLtk = null
+        pendingBleLtkCallback = {}
         incomingMessages.close(error)
         ioJob?.cancel()
         ioJob = null

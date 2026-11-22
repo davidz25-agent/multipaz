@@ -22,6 +22,7 @@ import kotlinx.io.bytestring.ByteString
 import kotlin.concurrent.Volatile
 import kotlin.time.Clock
 import kotlin.time.Instant
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.role.MdocRole
@@ -36,6 +37,7 @@ internal class BleTransportPeripheralMdocReader(
     private val uuid: UUID,
     private val psm: Int?,
     private val peripheralAddress: BlePeripheralAddress? = null,
+    private val bleChannelSoundingAvailable: Boolean = false,
 ) : MdocTransport() {
     companion object {
         private const val TAG = "BleTransportPeripheralMdocReader"
@@ -47,6 +49,12 @@ internal class BleTransportPeripheralMdocReader(
     private val mutex = Mutex()
     @Volatile
     private var currentJob: Job? = null
+    @Volatile
+    private var channelSoundingJob: Job? = null
+    @Volatile
+    private var activeChannelSoundingLtk: SecretKey? = null
+    @Volatile
+    private var activeChannelSoundingCallback: (BleChannelSoundingResult) -> Unit = {}
 
     private val _state = MutableStateFlow<State>(State.IDLE)
     override val state: StateFlow<State> = _state.asStateFlow()
@@ -57,11 +65,13 @@ internal class BleTransportPeripheralMdocReader(
                 uuid = uuid,
                 psm = psm,
                 peripheralAddress = peripheralAddress,
+                bleChannelSoundingAvailable = bleChannelSoundingAvailable,
             )
         } else {
             MdocConnectionMethod.Ble.GattPeripheral(
                 uuid = uuid,
                 peripheralAddress = peripheralAddress,
+                bleChannelSoundingAvailable = bleChannelSoundingAvailable,
             )
         }
 
@@ -289,18 +299,76 @@ internal class BleTransportPeripheralMdocReader(
         }
     }
 
+    override fun startBleChannelSounding(
+        bleLtk: SecretKey,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        bleLtk.checkNotDestroyed()
+        if (!bleChannelSoundingAvailable) {
+            return
+        }
+        val ltkCopy = SecretKey(bleLtk)
+        var transferred = false
+        val launchJob = transportScope.launch {
+            mutex.withLock {
+                if (_state.value != State.CONNECTED) {
+                    return@withLock
+                }
+                val currentLtk = activeChannelSoundingLtk
+                if (currentLtk != null && !currentLtk.isDestroyed &&
+                    currentLtk == ltkCopy && channelSoundingJob?.isActive == true
+                ) {
+                    activeChannelSoundingCallback = onResult
+                    return@withLock
+                }
+                channelSoundingJob?.cancel()
+                currentLtk?.close()
+                activeChannelSoundingLtk = ltkCopy
+                activeChannelSoundingCallback = onResult
+                transferred = true
+                val jobLtk = SecretKey(ltkCopy)
+                val job = transportScope.launch {
+                    jobLtk.use { key ->
+                        centralManager.startChannelSounding(
+                            asInitiator = true,
+                            ephemeralLtk = key,
+                            onResult = { result -> activeChannelSoundingCallback(result) },
+                        )
+                    }
+                }
+                job.invokeOnCompletion {
+                    jobLtk.close()
+                }
+                channelSoundingJob = job
+            }
+        }
+        launchJob.invokeOnCompletion {
+            if (!transferred) {
+                ltkCopy.close()
+            }
+        }
+    }
+
     private fun failTransport(error: Throwable) {
         check(mutex.isLocked) { "failTransport called without holding lock" }
         if (_state.value == State.FAILED || _state.value == State.CLOSED) {
             return
         }
         Logger.w(TAG, "Failing transport with error", error)
+        channelSoundingJob?.cancel()
+        activeChannelSoundingLtk?.close()
+        activeChannelSoundingLtk = null
+        activeChannelSoundingCallback = {}
         centralManager.close()
         _state.value = State.FAILED
     }
 
     private fun closeWithoutDelay() {
         check(mutex.isLocked) { "closeWithoutDelay called without holding lock" }
+        channelSoundingJob?.cancel()
+        activeChannelSoundingLtk?.close()
+        activeChannelSoundingLtk = null
+        activeChannelSoundingCallback = {}
         centralManager.close()
         _state.value = State.CLOSED
     }

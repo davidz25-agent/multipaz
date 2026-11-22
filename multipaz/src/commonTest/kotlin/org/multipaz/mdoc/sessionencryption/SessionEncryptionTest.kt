@@ -17,10 +17,12 @@ package org.multipaz.mdoc.sessionencryption
 
 import kotlinx.coroutines.test.runTest
 import org.multipaz.cbor.Cbor
+import org.multipaz.crypto.Algorithm
 import org.multipaz.crypto.Crypto
 import org.multipaz.crypto.EcCurve
 import org.multipaz.crypto.EcPrivateKey
 import org.multipaz.crypto.EcPrivateKeyDoubleCoordinate
+import org.multipaz.crypto.Hkdf
 import org.multipaz.mdoc.TestVectors
 import org.multipaz.mdoc.engagement.DeviceEngagement
 import org.multipaz.mdoc.role.MdocRole
@@ -337,5 +339,70 @@ class SessionEncryptionTest {
         assertNull(decryptedTerm)
         assertEquals(Constants.SESSION_DATA_STATUS_SESSION_TERMINATION, termStatus)
         assertEquals(3, holderEncryption.nextSequenceNumber)
+    }
+
+    @Test
+    fun testBleLtkDerivationMatchesAcrossRoles() = runTest {
+        val eReaderKey: EcPrivateKey = EcPrivateKeyDoubleCoordinate(
+            EcCurve.P256,
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_READER_KEY_D.fromHex(),
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_READER_KEY_X.fromHex(),
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_READER_KEY_Y.fromHex()
+        )
+        val eDeviceKey: EcPrivateKey = EcPrivateKeyDoubleCoordinate(
+            EcCurve.P256,
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_DEVICE_KEY_D.fromHex(),
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_DEVICE_KEY_X.fromHex(),
+            TestVectors.ISO_18013_5_ANNEX_D_EPHEMERAL_DEVICE_KEY_Y.fromHex()
+        )
+        val sessionTranscriptBytes =
+            TestVectors.ISO_18013_5_ANNEX_D_SESSION_TRANSCRIPT_BYTES.fromHex()
+        val sessionTranscript = Cbor.decode(sessionTranscriptBytes).asTaggedEncodedCbor
+        val encodedSessionTranscript = Cbor.encode(sessionTranscript)
+
+        val expectedBleLtk = Crypto.keyAgreement(eReaderKey, eDeviceKey.publicKey).use { zab ->
+            val salt = Crypto.digest(Algorithm.SHA256, sessionTranscriptBytes)
+            Hkdf.deriveKey(
+                Algorithm.HMAC_SHA256,
+                zab,
+                salt,
+                "BLELTK".encodeToByteArray(),
+                16
+            ).use { it.encoded }
+        }
+
+        SessionEncryption(
+            MdocRole.MDOC_READER,
+            eReaderKey,
+            eDeviceKey.publicKey,
+            encodedSessionTranscript
+        ).use { readerSe ->
+            SessionEncryption(
+                MdocRole.MDOC,
+                eDeviceKey,
+                eReaderKey.publicKey,
+                encodedSessionTranscript
+            ).use { mdocSe ->
+                val readerBleLtk = readerSe.getBleLtk()
+                val mdocBleLtk = mdocSe.getBleLtk()
+                assertEquals(16, readerBleLtk.size)
+                assertEquals(readerBleLtk, mdocBleLtk)
+                assertContentEquals(expectedBleLtk, readerBleLtk.toByteArray())
+
+                // Closing a returned SecretKey copy destroys that instance without invalidating
+                // SessionEncryption's internal BLELTK for subsequent calls.
+                readerBleLtk.close()
+                assertTrue(readerBleLtk.isDestroyed)
+                assertFailsWith<IllegalStateException> {
+                    readerBleLtk.toByteArray()
+                }
+                readerSe.getBleLtk().use { secondReaderBleLtk ->
+                    assertFalse(secondReaderBleLtk.isDestroyed)
+                    assertEquals(mdocBleLtk, secondReaderBleLtk)
+                }
+                mdocBleLtk.close()
+                assertTrue(mdocBleLtk.isDestroyed)
+            }
+        }
     }
 }

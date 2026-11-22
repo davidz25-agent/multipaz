@@ -21,3 +21,5 @@ internal actual fun defaultMdocTransportFactoryCreateTransports(
     }
     throw NotImplementedError("MdocTransportFactory is not available for JS")
 }
+
+internal actual suspend fun defaultMdocTransportFactoryIsBleChannelSoundingAvailable(): Boolean = false

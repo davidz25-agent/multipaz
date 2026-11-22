@@ -23,6 +23,7 @@ import kotlin.concurrent.Volatile
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Instant
+import org.multipaz.crypto.SecretKey
 import org.multipaz.mdoc.connectionmethod.BlePeripheralAddress
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethod
 import org.multipaz.mdoc.role.MdocRole
@@ -37,6 +38,7 @@ internal class BleTransportPeripheralMdoc(
     private val gattEnabled: Boolean = true,
     private val directL2capEnabled: Boolean = false,
     private val configuredPeripheralAddress: BlePeripheralAddress? = null,
+    private val bleChannelSoundingAvailable: Boolean = false,
 ) : MdocTransport() {
     companion object {
         private const val TAG = "BleTransportPeripheralMdoc"
@@ -46,6 +48,12 @@ internal class BleTransportPeripheralMdoc(
     private val mutex = Mutex()
     @Volatile
     private var currentJob: Job? = null
+    @Volatile
+    private var channelSoundingJob: Job? = null
+    @Volatile
+    private var activeChannelSoundingLtk: SecretKey? = null
+    @Volatile
+    private var activeChannelSoundingCallback: (BleChannelSoundingResult) -> Unit = {}
 
     private val _state = MutableStateFlow<State>(State.IDLE)
     override val state: StateFlow<State> = _state.asStateFlow()
@@ -65,6 +73,7 @@ internal class BleTransportPeripheralMdoc(
                             uuid = uuid,
                             psm = psm,
                             peripheralAddress = addr,
+                            bleChannelSoundingAvailable = bleChannelSoundingAvailable,
                         )
                     )
                 }
@@ -73,6 +82,7 @@ internal class BleTransportPeripheralMdoc(
                         MdocConnectionMethod.Ble.GattPeripheral(
                             uuid = uuid,
                             peripheralAddress = addr,
+                            bleChannelSoundingAvailable = bleChannelSoundingAvailable,
                         )
                     )
                 }
@@ -82,6 +92,7 @@ internal class BleTransportPeripheralMdoc(
                             uuid = uuid,
                             psm = null,
                             peripheralAddress = addr,
+                            bleChannelSoundingAvailable = bleChannelSoundingAvailable,
                         )
                     )
                 }
@@ -306,18 +317,76 @@ internal class BleTransportPeripheralMdoc(
         }
     }
 
+    override fun startBleChannelSounding(
+        bleLtk: SecretKey,
+        onResult: (BleChannelSoundingResult) -> Unit,
+    ) {
+        bleLtk.checkNotDestroyed()
+        if (!bleChannelSoundingAvailable) {
+            return
+        }
+        val ltkCopy = SecretKey(bleLtk)
+        var transferred = false
+        val launchJob = transportScope.launch {
+            mutex.withLock {
+                if (_state.value != State.CONNECTED) {
+                    return@withLock
+                }
+                val currentLtk = activeChannelSoundingLtk
+                if (currentLtk != null && !currentLtk.isDestroyed &&
+                    currentLtk == ltkCopy && channelSoundingJob?.isActive == true
+                ) {
+                    activeChannelSoundingCallback = onResult
+                    return@withLock
+                }
+                channelSoundingJob?.cancel()
+                currentLtk?.close()
+                activeChannelSoundingLtk = ltkCopy
+                activeChannelSoundingCallback = onResult
+                transferred = true
+                val jobLtk = SecretKey(ltkCopy)
+                val job = transportScope.launch {
+                    jobLtk.use { key ->
+                        peripheralManager.startChannelSounding(
+                            asInitiator = false,
+                            ephemeralLtk = key,
+                            onResult = { result -> activeChannelSoundingCallback(result) },
+                        )
+                    }
+                }
+                job.invokeOnCompletion {
+                    jobLtk.close()
+                }
+                channelSoundingJob = job
+            }
+        }
+        launchJob.invokeOnCompletion {
+            if (!transferred) {
+                ltkCopy.close()
+            }
+        }
+    }
+
     private fun failTransport(error: Throwable) {
         check(mutex.isLocked) { "failTransport called without holding lock" }
         if (_state.value == State.FAILED || _state.value == State.CLOSED) {
             return
         }
         Logger.w(TAG, "Failing transport with error", error)
+        channelSoundingJob?.cancel()
+        activeChannelSoundingLtk?.close()
+        activeChannelSoundingLtk = null
+        activeChannelSoundingCallback = {}
         peripheralManager.close()
         _state.value = State.FAILED
     }
 
     private fun closeWithoutDelay() {
         check(mutex.isLocked) { "closeWithoutDelay called without holding lock" }
+        channelSoundingJob?.cancel()
+        activeChannelSoundingLtk?.close()
+        activeChannelSoundingLtk = null
+        activeChannelSoundingCallback = {}
         peripheralManager.close()
         _state.value = State.CLOSED
     }

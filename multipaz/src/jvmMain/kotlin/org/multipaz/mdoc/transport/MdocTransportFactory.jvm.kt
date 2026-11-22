@@ -27,3 +27,5 @@ internal actual fun defaultMdocTransportFactoryCreateTransports(
 ): List<MdocTransport> = connectionMethods.map {
     defaultMdocTransportFactoryCreateTransport(it, role, options)
 }
+
+internal actual suspend fun defaultMdocTransportFactoryIsBleChannelSoundingAvailable(): Boolean = false

@@ -49,6 +49,14 @@ interface MdocTransportFactory {
     ): List<MdocTransport> = connectionMethods.map { createTransport(it, role, options) }
 
     /**
+     * Checks whether Bluetooth Channel Sounding (CS) is supported and available on BLE transports
+     * created by this factory.
+     *
+     * @return `true` if Bluetooth Channel Sounding is supported and enabled, `false` otherwise.
+     */
+    suspend fun isBleChannelSoundingAvailable(): Boolean = false
+
+    /**
      * The default factory for the platform.
      */
     object Default : MdocTransportFactory {
@@ -63,6 +71,9 @@ interface MdocTransportFactory {
             role: MdocRole,
             options: MdocTransportOptions,
         ): List<MdocTransport> = defaultMdocTransportFactoryCreateTransports(connectionMethods, role, options)
+
+        override suspend fun isBleChannelSoundingAvailable(): Boolean =
+            defaultMdocTransportFactoryIsBleChannelSoundingAvailable()
     }
 }
 
@@ -77,3 +88,5 @@ internal expect fun defaultMdocTransportFactoryCreateTransports(
     role: MdocRole,
     options: MdocTransportOptions,
 ): List<MdocTransport>
+
+internal expect suspend fun defaultMdocTransportFactoryIsBleChannelSoundingAvailable(): Boolean
